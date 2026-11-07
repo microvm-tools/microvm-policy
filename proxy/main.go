@@ -122,9 +122,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	// The usage file exists from the start: a reader at exit finds one even
-	// when no request came.
-	p.writeUsage()
 	srv := &http.Server{Handler: p, ReadHeaderTimeout: 30 * time.Second}
 	if err := srv.Serve(ln); err != nil {
 		fmt.Fprintln(os.Stderr, "egress-proxy:", err)
@@ -164,6 +161,12 @@ func load(path string) (*Proxy, *Config, error) {
 		transport:     &http.Transport{Proxy: http.ProxyFromEnvironment},
 		upstreamProxy: http.ProxyFromEnvironment,
 		usageFile:     cfg.UsageFile,
+	}
+	// The usage file exists from the start, before the proxy says it is up: a
+	// reader at exit finds one even when no request came, and one that cannot
+	// be written is found now, not after the session.
+	if err := p.saveUsage(); err != nil {
+		return nil, nil, fmt.Errorf("usage file: %w", err)
 	}
 	return p, cfg, nil
 }

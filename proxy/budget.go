@@ -40,11 +40,14 @@ func (t *Tokens) add(o Tokens) {
 	t.Output += o.Output
 }
 
-// meter is an endpoint's spend so far.
+// meter is an endpoint's spend so far. unknown counts successful metered
+// responses whose usage could not be read: under a token budget one is
+// enough to end the session, since what it spent is not known.
 type meter struct {
 	mu       sync.Mutex
 	requests int64
 	refused  int64
+	unknown  int64
 	tokens   Tokens
 }
 
@@ -52,7 +55,7 @@ type meter struct {
 func (ep *Endpoint) spentLocked() bool {
 	b, m := ep.Budget, &ep.meter
 	return b != nil && ((b.MaxRequests > 0 && m.requests >= b.MaxRequests) ||
-		(b.MaxTokens > 0 && m.tokens.total() >= b.MaxTokens))
+		(b.MaxTokens > 0 && (m.tokens.total() >= b.MaxTokens || m.unknown > 0)))
 }
 
 // admit reserves one request against the budget, or refuses it.
@@ -74,9 +77,21 @@ func (ep *Endpoint) unadmit() {
 	ep.meter.mu.Unlock()
 }
 
-func (ep *Endpoint) charge(t Tokens) {
+// refuse counts a request turned away without being admitted.
+func (ep *Endpoint) refuse() {
+	ep.meter.mu.Lock()
+	ep.meter.refused++
+	ep.meter.mu.Unlock()
+}
+
+// charge adds what a response reported — or, when its usage could not be
+// read (ok false), counts it as unknown.
+func (ep *Endpoint) charge(t Tokens, ok bool) {
 	ep.meter.mu.Lock()
 	ep.meter.tokens.add(t)
+	if !ok {
+		ep.meter.unknown++
+	}
 	ep.meter.mu.Unlock()
 }
 
@@ -91,18 +106,52 @@ func (ep *Endpoint) budgetMsg() string {
 	if b.MaxTokens > 0 {
 		limits = append(limits, fmt.Sprintf("%d tokens", b.MaxTokens))
 	}
+	ep.meter.mu.Lock()
+	unknown := ep.meter.unknown
+	ep.meter.mu.Unlock()
+	if b.MaxTokens > 0 && unknown > 0 {
+		return fmt.Sprintf("egress-proxy: %s: the usage of an earlier response could not be read, so this session's API budget (%s) can no longer be kept — no further requests will be sent; finish with what you have",
+			ep.Prefix, strings.Join(limits, ", "))
+	}
 	return fmt.Sprintf("egress-proxy: %s: this session's API budget (%s) is spent — no further requests will be sent; finish with what you have",
 		ep.Prefix, strings.Join(limits, ", "))
+}
+
+// unmeterableMsg is what a request is told when a token budget is set and
+// the proxy cannot read what the request costs: a batch, billed later.
+func (ep *Endpoint) unmeterableMsg(rest string) string {
+	return fmt.Sprintf("egress-proxy: %s %s: refused under this session's token budget — the proxy cannot read what it costs (it reads %s)",
+		ep.Prefix, rest, usageFormats[ep.Usage].metered)
+}
+
+// budgetDecision applies the budget to a request its path grant let
+// through: refused, the decision is over_budget and refusal says why.
+// Admitted, the request is reserved now, so concurrent requests cannot all
+// pass on the same last unit.
+func (ep *Endpoint) budgetDecision(rest, decision string) (string, string) {
+	if decision == "deny" {
+		return decision, ""
+	}
+	if ep.Budget != nil && ep.Budget.MaxTokens > 0 && ep.pathClass(rest) == pathUnmeterable {
+		ep.refuse()
+		return "over_budget", ep.unmeterableMsg(rest)
+	}
+	if !ep.admit() {
+		return "over_budget", ep.budgetMsg()
+	}
+	return decision, ""
 }
 
 // --- the usage summary file ---
 
 type usageEntry struct {
-	Prefix    string  `json:"prefix"`
-	Upstream  string  `json:"upstream"`
-	Requests  int64   `json:"requests"`
-	Refused   int64   `json:"refused"`
-	Tokens    *Tokens `json:"tokens"` // null: the endpoint is not metered
+	Prefix   string  `json:"prefix"`
+	Upstream string  `json:"upstream"`
+	Requests int64   `json:"requests"`
+	Refused  int64   `json:"refused"`
+	Tokens   *Tokens `json:"tokens"` // null: the endpoint is not metered
+	// Unknown counts successful responses whose usage could not be read.
+	Unknown   int64   `json:"unknownUsage"`
 	Budget    *Budget `json:"budget"`
 	Exhausted bool    `json:"exhausted"`
 }
@@ -110,8 +159,17 @@ type usageEntry struct {
 // writeUsage replaces UsageFile with the spend so far: written whole to a
 // temporary file beside it and renamed, so a reader never sees half of one.
 func (p *Proxy) writeUsage() {
+	if err := p.saveUsage(); err != nil {
+		// Nothing to fail: the request is already answered. Say so where
+		// the launcher's journal sees it.
+		fmt.Fprintln(os.Stderr, "egress-proxy: usage file:", err)
+	}
+}
+
+// saveUsage is writeUsage, reporting a failure: at start it is fatal.
+func (p *Proxy) saveUsage() error {
 	if p.usageFile == "" {
-		return
+		return nil
 	}
 	p.usageMu.Lock()
 	defer p.usageMu.Unlock()
@@ -126,19 +184,16 @@ func (p *Proxy) writeUsage() {
 		if ep.Usage != "" {
 			t := ep.meter.tokens
 			e.Tokens = &t
+			e.Unknown = ep.meter.unknown
 		}
 		ep.meter.mu.Unlock()
 		entries = append(entries, e)
 	}
 	raw, err := json.Marshal(map[string]any{"endpoints": entries})
-	if err == nil {
-		err = writeFileAtomic(p.usageFile, append(raw, '\n'))
-	}
 	if err != nil {
-		// Nothing to fail: the request is already answered. Say so where
-		// the launcher's journal sees it.
-		fmt.Fprintln(os.Stderr, "egress-proxy: usage file:", err)
+		return fmt.Errorf("encode: %w", err)
 	}
+	return writeFileAtomic(p.usageFile, append(raw, '\n'))
 }
 
 func writeFileAtomic(path string, data []byte) error {
@@ -164,23 +219,69 @@ func writeFileAtomic(path string, data []byte) error {
 
 // --- reading usage out of responses ---
 
-// usageParsers are the response formats a metered endpoint can name.
-var usageParsers = map[string]func(contentType string) usageParser{
-	"anthropic": newAnthropicUsage,
+// pathClass is what a path under a metered endpoint costs, as far as the
+// proxy can tell.
+type pathClass int
+
+const (
+	// pathUnmeterable costs tokens the proxy cannot read (a batch, billed
+	// when it runs): refused under a token budget.
+	pathUnmeterable pathClass = iota
+	// pathMetered reports its usage in the response.
+	pathMetered
+	// pathFree costs no tokens.
+	pathFree
+)
+
+// usageFormat is a response format a metered endpoint can name: how to read
+// usage out of a response, and which paths report it.
+type usageFormat struct {
+	parser   func(contentType string) usageParser
+	classify func(path string) pathClass
+	metered  string // the metered paths, for messages
+}
+
+var usageFormats = map[string]usageFormat{
+	"anthropic": {parser: newAnthropicUsage, classify: anthropicPathClass, metered: "/v1/messages and /v1/messages/count_tokens"},
+}
+
+// anthropicPathClass: the Messages API reports usage in each response, and
+// token counting is free. Everything else under a /v1/messages grant — the
+// batches — is billed later, out of the proxy's sight.
+func anthropicPathClass(p string) pathClass {
+	switch p {
+	case "/v1/messages":
+		return pathMetered
+	case "/v1/messages/count_tokens":
+		return pathFree
+	}
+	return pathUnmeterable
+}
+
+// pathClass for an endpoint without a usage format: nothing is metered, and
+// nothing needs to be.
+func (ep *Endpoint) pathClass(rest string) pathClass {
+	if ep.Usage == "" {
+		return pathFree
+	}
+	return usageFormats[ep.Usage].classify(rest)
 }
 
 // usageParser sees a response body as it streams past (Write) and reports
-// what it found when the body ends — or is cut short (result).
+// what it found when the body ends — or is cut short (result): the tokens,
+// and whether any usage was seen at all.
 type usageParser interface {
 	Write(p []byte) (int, error)
-	result() Tokens
+	result() (Tokens, bool)
 }
 
-// sseLineMax bounds one buffered event line. Usage arrives in small events;
-// a longer line (a large content delta) is skipped, not buffered.
+// sseLineMax bounds one buffered event line, and one event's data. Usage
+// arrives in small events; a longer one (a large content delta) is skipped,
+// not buffered.
 const sseLineMax = 1 << 20
 
-// jsonBodyMax bounds a buffered non-streaming body.
+// jsonBodyMax bounds a buffered non-streaming body. One past it is not read:
+// its usage is unknown.
 const jsonBodyMax = 32 << 20
 
 // anthropicUsageJSON is the Messages API's usage object. In a stream,
@@ -194,12 +295,16 @@ type anthropicUsageJSON struct {
 }
 
 type anthropicUsage struct {
-	sse     bool
-	line    []byte
-	skip    bool // the current line outgrew sseLineMax
-	body    bytes.Buffer
-	tooBig  bool
-	maxSeen Tokens
+	sse      bool
+	line     []byte
+	lineSkip bool   // the current line outgrew sseLineMax
+	data     []byte // the current event's data lines, joined by "\n"
+	hasData  bool
+	dataSkip bool // the current event outgrew sseLineMax
+	body     bytes.Buffer
+	tooBig   bool
+	maxSeen  Tokens
+	seen     bool
 }
 
 func newAnthropicUsage(contentType string) usageParser {
@@ -225,9 +330,9 @@ func (a *anthropicUsage) Write(p []byte) (int, error) {
 		if i >= 0 {
 			chunk = p[:i]
 		}
-		if !a.skip {
+		if !a.lineSkip {
 			if len(a.line)+len(chunk) > sseLineMax {
-				a.skip = true
+				a.lineSkip = true
 				a.line = a.line[:0]
 			} else {
 				a.line = append(a.line, chunk...)
@@ -236,18 +341,61 @@ func (a *anthropicUsage) Write(p []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		if !a.skip {
-			a.event(a.line)
-		}
-		a.line, a.skip = a.line[:0], false
+		a.endLine()
 		p = p[i+1:]
 	}
 	return n, nil
 }
 
-func (a *anthropicUsage) event(line []byte) {
-	data, ok := bytes.CutPrefix(bytes.TrimRight(line, "\r"), []byte("data:"))
-	if !ok || !bytes.Contains(data, []byte(`"usage"`)) {
+// endLine takes one complete line. A skipped line spoils its event.
+func (a *anthropicUsage) endLine() {
+	if a.lineSkip {
+		a.dataSkip = true
+	} else {
+		a.field(a.line)
+	}
+	a.line, a.lineSkip = a.line[:0], false
+}
+
+// field reads one line of an event: data lines are gathered, as the event
+// stream format joins them, and a blank line ends the event. Other fields
+// (event:, id:, comments) carry nothing to count.
+func (a *anthropicUsage) field(line []byte) {
+	line = bytes.TrimRight(line, "\r")
+	if len(line) == 0 {
+		a.dispatch()
+		return
+	}
+	v, ok := bytes.CutPrefix(line, []byte("data:"))
+	if !ok || a.dataSkip {
+		return
+	}
+	v = bytes.TrimPrefix(v, []byte(" "))
+	extra := len(v)
+	if a.hasData {
+		extra++
+	}
+	if len(a.data)+extra > sseLineMax {
+		a.dataSkip = true
+		a.data = a.data[:0]
+		return
+	}
+	if a.hasData {
+		a.data = append(a.data, '\n')
+	}
+	a.data = append(a.data, v...)
+	a.hasData = true
+}
+
+func (a *anthropicUsage) dispatch() {
+	if a.hasData && !a.dataSkip {
+		a.event(a.data)
+	}
+	a.data, a.hasData, a.dataSkip = a.data[:0], false, false
+}
+
+func (a *anthropicUsage) event(data []byte) {
+	if !bytes.Contains(data, []byte(`"usage"`)) {
 		return
 	}
 	var ev struct {
@@ -256,7 +404,7 @@ func (a *anthropicUsage) event(line []byte) {
 		} `json:"message"`
 		Usage *anthropicUsageJSON `json:"usage"`
 	}
-	if json.Unmarshal(bytes.TrimSpace(data), &ev) != nil {
+	if json.Unmarshal(data, &ev) != nil {
 		return
 	}
 	if ev.Message != nil {
@@ -269,14 +417,22 @@ func (a *anthropicUsage) see(u *anthropicUsageJSON) {
 	if u == nil {
 		return
 	}
+	a.seen = true
 	a.maxSeen.Input = max(a.maxSeen.Input, u.Input)
 	a.maxSeen.CacheCreation = max(a.maxSeen.CacheCreation, u.CacheCreation)
 	a.maxSeen.CacheRead = max(a.maxSeen.CacheRead, u.CacheRead)
 	a.maxSeen.Output = max(a.maxSeen.Output, u.Output)
 }
 
-func (a *anthropicUsage) result() Tokens {
-	if !a.sse && !a.tooBig && a.body.Len() > 0 {
+func (a *anthropicUsage) result() (Tokens, bool) {
+	if a.sse {
+		// A stream that ends without its final newline or blank line still
+		// had its last event.
+		if len(a.line) > 0 || a.lineSkip {
+			a.endLine()
+		}
+		a.dispatch()
+	} else if !a.tooBig && a.body.Len() > 0 {
 		var body struct {
 			Usage *anthropicUsageJSON `json:"usage"`
 		}
@@ -284,13 +440,13 @@ func (a *anthropicUsage) result() Tokens {
 			a.see(body.Usage)
 		}
 	}
-	return a.maxSeen
+	return a.maxSeen, a.seen
 }
 
 // initBudget checks an endpoint's usage format and budget at start.
 func (ep *Endpoint) initBudget() error {
 	if ep.Usage != "" {
-		if _, ok := usageParsers[ep.Usage]; !ok {
+		if _, ok := usageFormats[ep.Usage]; !ok {
 			return fmt.Errorf("usage must be \"anthropic\" or empty, got %q", ep.Usage)
 		}
 	}
