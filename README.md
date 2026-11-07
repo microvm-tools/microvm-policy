@@ -25,7 +25,8 @@ needs — stays in the consumer.
   (deny off-allowlist) and `log` (allow but audit as `would_deny` — the
   "shadow" rung).
 - **`egress-report.sh`** — host-side pcap summariser and live allowlist
-  matcher, for observe-only monitoring (`packages.egress-report`).
+  matcher, for observe-only monitoring, and a verdict over the proxy's audit
+  log for sealed runs (`packages.egress-report`).
 - **`modules/egress.nix`** — guest module for the sealed modes: static
   resolver emptied under seal, a boot-time seal self-test, ssh routed
   through the proxy, and the proxy env handed to system services that need
@@ -112,13 +113,37 @@ For a complete consumer, see
 `common.txt`, and its launcher seals the VM's netdev and runs `egress-proxy`
 and `egress-report` on the host.
 
+### Judging a run: `egress-report verdict`
+
+```sh
+egress-report verdict <audit.jsonl>
+```
+
+reads the proxy's audit log from a sealed run and answers one question: did
+anything other than the model API leave the VM, or try to? A run is clean
+when every decision in the log is an allowed request to a reverse-proxied
+endpoint (`kind: api`, `decision: allow`). An allowed tunnel counts against
+it as much as a denied one — the point is that nothing else was reached —
+and so do a denied API path and a shadow-mode `would_deny`.
+
+| Exit | Meaning | Output |
+|------|---------|--------|
+| 0 | clean (an empty log too: the proxy saw nothing) | one line: `egress verdict: clean — N model-API request(s), no other egress` |
+| 2 | not clean | `egress verdict: NOT CLEAN — …`, then each other decision, counted: `decision kind host:port` (`host/path` for an API one) |
+| 65 | a line is not a proxy decision — truncated, blank, foreign | `egress verdict: INVALID — …` with the first such line's number |
+| 66 | no log at the path | error on stderr |
+
+A log that cannot be read is never clean: an audit run should treat 65 and
+66 the way it treats 2.
+
 ## Checks
 
 `nix flake check` runs the proxy's Go unit tests, the `egress-report`
-summariser against a synthesised capture, and a multi-node `nixosTest`
-(`egress-integration`) that drives the real proxy — reverse-proxy
-strip/inject, path allowlist, `CONNECT` allow/deny with port grants, and
-upstream-proxy chaining — across four VMs, and one (`guest-pod-network`) that
+summariser against a synthesised capture and its verdict against synthesised
+audit logs, a multi-node `nixosTest` (`egress-integration`) that drives the
+real proxy — reverse-proxy strip/inject, path allowlist, `CONNECT` allow/deny
+with port grants, upstream-proxy chaining, and `verdict` on its real log —
+across four VMs, and one (`guest-pod-network`) that
 runs the guest module without slirp: policy as instance data, the proxy
 environment exported by the guest, direct egress refused.
 

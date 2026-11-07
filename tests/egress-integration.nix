@@ -13,7 +13,7 @@
 # Topology:   client ──proxy(enforce)──corp(log, permissive)──upstream
 # The proxy's HTTP(S)_PROXY points at corp, so every upstream dial — the opaque
 # CONNECT leg and the reverse-proxy leg both — goes through it.
-{ pkgs, lib, egressProxy }:
+{ pkgs, lib, egressProxy, egressReport }:
 
 let
   # Records the credential headers it receives, so the test can prove the
@@ -96,6 +96,7 @@ pkgs.testers.runNixOSTest {
       # Bare 'upstream' grants :80 only; :443 is denied, which also exercises
       # the per-entry port grant.
       environment.etc."egress-allow.txt".text = "upstream:80\n";
+      environment.systemPackages = [ egressReport ];
       systemd.services.egress = proxyService
         "${egressProxy}/bin/egress-proxy -config ${proxyCfg}"
         {
@@ -254,5 +255,17 @@ pkgs.testers.runNixOSTest {
         f"proxy did not record the path denial: {proxy_audit!r}"
     assert '"port":443,"path":"","decision":"deny"' in proxy_audit, \
         f"proxy did not record the off-port CONNECT denial: {proxy_audit!r}"
+
+    # --- egress-report verdict reads the real proxy's log, not a synthesized
+    #     one: the denials make this run not clean (2, not 65 for a log it
+    #     cannot read), the model-API requests are counted, each denial named ---
+    verdict = proxy.succeed(
+        "rc=0; egress-report verdict /tmp/proxy-audit.jsonl || rc=$?; echo rc=$rc"
+    )
+    assert "rc=2" in verdict and "egress verdict: NOT CLEAN" in verdict, f"verdict: {verdict!r}"
+    assert "; 0 model-API" not in verdict and "model-API request(s) allowed" in verdict, \
+        f"verdict counted no model-API request: {verdict!r}"
+    assert "deny api upstream/v1/files" in verdict and "deny connect upstream:443" in verdict, \
+        f"verdict did not name the denials: {verdict!r}"
   '';
 }

@@ -10,22 +10,32 @@
 # Usage:
 #   egress-report summarize <pcap> [--allowlist FILE]
 #   egress-report follow <pcap> --allowlist FILE --alerts FILE
+#   egress-report verdict <audit.jsonl>
 #
 # summarize prints a report to stdout; with --allowlist it appends a
 # violations section and exits 2 when any observed hostname matched no entry.
 # follow tails a growing capture and appends one line per newly seen
 # off-allowlist hostname to the alerts file; it runs until killed.
 #
+# verdict reads the egress proxy's JSONL audit log (the sealed modes, not a
+# pcap) and judges a run: clean when every decision is an allowed request to
+# a model-API endpoint — nothing else left the VM, or even tried to. Exits 0
+# clean, printing one line; 2 not clean, the line then the other decisions,
+# counted; 65 when a line is not a proxy decision (a truncated or foreign
+# log is no evidence of anything); 66 when there is no log. An empty log is
+# clean: the proxy saw no traffic at all.
+#
 # Allowlist format: one domain per line, '#' starts a comment. An entry
 # matches itself and every subdomain. A leading '*.' and a ':port' suffix
 # are tolerated and ignored.
 #
 # Packaged with pkgs.writeShellApplication (flake.nix), which provides
-# `set -euo pipefail` and puts tshark/gawk/coreutils on PATH.
+# `set -euo pipefail` and puts tshark/gawk/jq/coreutils on PATH.
 
 usage() {
   echo "usage: egress-report summarize <pcap> [--allowlist FILE]" >&2
   echo "       egress-report follow <pcap> --allowlist FILE --alerts FILE" >&2
+  echo "       egress-report verdict <audit.jsonl>" >&2
   exit 64
 }
 
@@ -179,7 +189,59 @@ FOLLOW_AWK='
 }
 '
 
+# The audit log, one slog JSON object per line (proxy.go, Proxy.log). Lines
+# are read raw, so one that is not JSON is reported by number rather than
+# aborting the parse. The first output line is the outcome for the shell;
+# the rest is the report. The grouping key names what was asked for: host
+# and port for a tunnel or plain-HTTP request, host and path for a model-API
+# one (whose port is always 0). A record is a decision only with every field
+# typed as the proxy writes it; anything else is INVALID, never a destination.
+# shellcheck disable=SC2016 # jq source, not shell — $x must stay literal
+VERDICT_JQ='
+def key: "\(.decision) \(.kind) \(.host)\(if .port > 0 then ":\(.port)" else "" end)\(if .kind == "api" then .path else "" end)";
+def is_decision: type == "object" and .msg == "decision"
+  and (.kind | type) == "string" and (.decision | type) == "string" and (.host | type) == "string"
+  and (.port | type) == "number" and (.path | type) == "string";
+[inputs] | to_entries | map({n: (.key + 1), j: (.value | try fromjson catch null)}) as $r
+| [$r[] | select(.j | is_decision | not) | .n] as $bad
+| [$r[] | .j | select(is_decision)] as $d
+| ([$d[] | select(.kind == "api" and .decision == "allow")] | length) as $api
+| [$d[] | select((.kind == "api" and .decision == "allow") | not)] as $other
+| if ($bad | length) > 0 then
+    "invalid",
+    "egress verdict: INVALID — \($bad | length) line(s) are not proxy decisions (first: line \($bad[0]))"
+  elif ($other | length) > 0 then
+    "dirty",
+    "egress verdict: NOT CLEAN — \($other | length) decision(s) other than an allowed model-API request; \($api) model-API request(s) allowed",
+    ($other | group_by(key) | sort_by(-length, (.[0] | key))[]
+     | "  \(length | tostring | (" " * (6 - length)) + .)  \(.[0] | key)")
+  else
+    "clean",
+    "egress verdict: clean — \($api) model-API request(s), no other egress"
+  end
+'
+
 case "$mode" in
+  verdict)
+    { [ -z "$allowlist" ] && [ -z "$alerts" ]; } || usage
+    log="$pcap"
+    if [ ! -f "$log" ]; then
+      echo "error: no audit log at $log" >&2
+      exit 66
+    fi
+    # jq's own failures must not pass for an outcome: its exit 2 is not ours.
+    if ! report="$(jq -nRr "$VERDICT_JQ" < "$log")"; then
+      echo "error: cannot read the audit log at $log" >&2
+      exit 65
+    fi
+    outcome="${report%%$'\n'*}"
+    printf '%s\n' "${report#*$'\n'}"
+    case "$outcome" in
+      clean)   exit 0 ;;
+      dirty)   exit 2 ;;
+      *)       exit 65 ;;
+    esac
+    ;;
   summarize)
     [ -z "$alerts" ] || usage
     if [ ! -f "$pcap" ]; then
