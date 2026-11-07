@@ -132,25 +132,37 @@ report what it spent:
 ```
 
 - `usage` names how to read token usage out of responses: `"anthropic"` (the
-  Messages API, streamed or not). The proxy drops the client's
-  `Accept-Encoding` on a metered endpoint so the body it reads is plain text;
-  the transport still negotiates gzip upstream. Without `usage`, tokens are
-  not counted.
+  Messages API, streamed or not). It meters `/v1/messages`; token counting
+  (`/v1/messages/count_tokens`) is free. The proxy drops the client's
+  `Accept-Encoding` (and `Range`) on a metered path so the body it reads is
+  plain text; the transport still negotiates gzip upstream. Without `usage`,
+  tokens are not counted.
 - `budget.maxRequests` counts requests sent upstream; `budget.maxTokens`
   counts input, cache creation, cache reads and output, summed, and needs
   `usage`. Either may be 0 (no limit on that axis), not both.
 - Once either limit is reached, further requests on the endpoint are refused
   with **403** — not 429, which API clients retry — and audited as
   `over_budget`, in both modes: a budget is a spending limit, not an egress
-  rule the shadow rung relaxes. A denied path or a request refused for want of
-  a credential spends nothing.
+  rule the shadow rung relaxes. A denied path, a request refused for want of a
+  credential, and one whose connection to the upstream was never made spend
+  nothing.
+- **Under `maxTokens` the meter fails closed.** A successful response on a
+  metered path whose usage cannot be read — none in it, a body past 32 MiB, an
+  encoding the transport did not undo, a stream cut before its first event —
+  counts as `unknownUsage`, and with a token limit the endpoint is spent from
+  then on: what the session spent is no longer known. A path the proxy cannot
+  meter at all — under a `/v1/messages` grant, the batches, billed later — is
+  refused (`over_budget`) while a token limit is set. Without one, both pass
+  and are only counted.
 - The check is made before a request goes upstream, so a request already in
   flight finishes: a session can overshoot `maxTokens` by what its concurrent
-  requests return.
-- `usageFile`, when set, is written at start and replaced (whole, atomically)
-  after each response and refusal: per endpoint `requests`, `refused`,
-  `tokens` (`input`, `cacheCreation`, `cacheRead`, `output`; null when not
-  metered), `budget`, and `exhausted`.
+  requests return. A stream cut short is charged what it reported by then —
+  its input in full, its output only as of the last count the API sent.
+- `usageFile`, when set, is written as the config loads — the proxy does not
+  start without it — and replaced (whole, atomically) after each response and
+  refusal: per endpoint `requests`, `refused`, `tokens` (`input`,
+  `cacheCreation`, `cacheRead`, `output`; null when not metered),
+  `unknownUsage`, `budget`, and `exhausted`.
 
 ### Judging a run: `egress-report verdict`
 

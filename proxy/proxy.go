@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -217,13 +218,9 @@ func (p *Proxy) serveEndpoint(ep *Endpoint, w http.ResponseWriter, r *http.Reque
 	// path.Clean defeats /../ hops out of the allowed subtree; the server
 	// hands us the path decoded, so encoded dots are already visible here.
 	rest := path.Clean("/" + strings.TrimPrefix(r.URL.Path, ep.Prefix))
-	decision := p.decide(pathAllowed(ep.AllowedPaths, rest))
 	// The budget, once the path is granted: a request it refuses never goes
-	// upstream. One it admits is reserved now, so concurrent requests cannot
-	// all pass on the same last unit.
-	if decision != "deny" && !ep.admit() {
-		decision = "over_budget"
-	}
+	// upstream.
+	decision, refusal := ep.budgetDecision(rest, p.decide(pathAllowed(ep.AllowedPaths, rest)))
 	p.log("api", ep.upstreamURL.Host, 0, rest, decision)
 	switch decision {
 	case "deny":
@@ -235,7 +232,7 @@ func (p *Proxy) serveEndpoint(ep *Endpoint, w http.ResponseWriter, r *http.Reque
 	case "over_budget":
 		// 403, not 429: API clients retry a 429, and this does not come back.
 		p.writeUsage()
-		http.Error(w, ep.budgetMsg(), http.StatusForbidden)
+		http.Error(w, refusal, http.StatusForbidden)
 		return
 	}
 	out := r.Clone(r.Context())
@@ -258,11 +255,12 @@ func (p *Proxy) serveEndpoint(ep *Endpoint, w http.ResponseWriter, r *http.Reque
 		// to passthrough would carry the client's own token instead. It never
 		// went upstream, so it spends nothing.
 		ep.unadmit()
+		p.writeUsage()
 		p.log("api", ep.upstreamURL.Host, 0, rest, "deny")
 		http.Error(w, fmt.Sprintf("egress-proxy: %s: credential unavailable: %v", ep.Prefix, err), http.StatusServiceUnavailable)
 		return
 	}
-	p.forwardMetered(ep, w, out)
+	p.forwardMetered(ep, w, out, rest)
 }
 
 // injectCredential replaces the client's credentials with the endpoint's
@@ -294,27 +292,56 @@ func (ep *Endpoint) injectCredential(out *http.Request) error {
 	return nil
 }
 
-// forwardMetered sends an admitted request upstream and, for an endpoint
-// with a usage format, charges what the response reports.
-func (p *Proxy) forwardMetered(ep *Endpoint, w http.ResponseWriter, out *http.Request) {
+// forwardMetered sends an admitted request upstream and, on a metered path,
+// charges what the response reports. A request that provably never left
+// (its connection was never made) gives its reservation back.
+func (p *Proxy) forwardMetered(ep *Endpoint, w http.ResponseWriter, out *http.Request, rest string) {
 	defer p.writeUsage()
-	if ep.Usage == "" {
-		p.roundTrip(w, out, nil)
+	var tap func(*http.Response) io.Writer
+	var parser usageParser
+	status := 0
+	metered := ep.pathClass(rest) == pathMetered
+	if metered {
+		// Usage is read from the body as it passes, so it must arrive as
+		// text. Without the client's Accept-Encoding — or a Range, which
+		// means nothing on a Messages POST — the transport asks for gzip
+		// itself and hands on the body decompressed.
+		out.Header.Del("Accept-Encoding")
+		out.Header.Del("Range")
+		tap = func(resp *http.Response) io.Writer {
+			status = resp.StatusCode
+			// An encoding the transport did not undo cannot be read: the
+			// response's usage stays unknown.
+			if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+				return nil
+			}
+			parser = usageFormats[ep.Usage].parser(resp.Header.Get("Content-Type"))
+			return parser
+		}
+	}
+	if err := p.roundTrip(w, out, tap); err != nil {
+		if notSent(err) {
+			ep.unadmit()
+		}
 		return
 	}
-	// Usage is read from the body as it passes, so it must arrive as text.
-	// Without the client's Accept-Encoding the transport asks for gzip
-	// itself and hands on the body decompressed.
-	out.Header.Del("Accept-Encoding")
-	var parser usageParser
-	p.roundTrip(w, out, func(resp *http.Response) io.Writer {
-		parser = usageParsers[ep.Usage](resp.Header.Get("Content-Type"))
-		return parser
-	})
-	if parser != nil {
-		// Charged even when the copy was cut short: what streamed was spent.
-		ep.charge(parser.result())
+	// Only a successful response is billed. Charged even when the copy was
+	// cut short — what streamed was spent — and unknown when no usage came
+	// through at all.
+	if metered && status >= 200 && status < 300 {
+		t, ok := Tokens{}, false
+		if parser != nil {
+			t, ok = parser.result()
+		}
+		ep.charge(t, ok)
 	}
+}
+
+// notSent tells a request that never reached the upstream — its connection
+// was never made — from one whose fate is unknown.
+func notSent(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 // pathAllowed grants "/v1/messages" and everything below it, but
@@ -354,16 +381,17 @@ func (p *Proxy) serveForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// No credential handling here: like the CONNECT tunnel, third-party
 	// traffic passes untouched — the proxy manages credentials only for the
 	// endpoints it owns.
-	p.roundTrip(w, out, nil)
+	_ = p.roundTrip(w, out, nil)
 }
 
-// roundTrip sends out and streams the response back. tap, when set, names a
-// writer that sees the response body too, as it passes.
-func (p *Proxy) roundTrip(w http.ResponseWriter, out *http.Request, tap func(*http.Response) io.Writer) {
+// roundTrip sends out and streams the response back; its error is the
+// transport's, when no response came. tap, when set, may name a writer that
+// sees the response body too, as it passes.
+func (p *Proxy) roundTrip(w http.ResponseWriter, out *http.Request, tap func(*http.Response) io.Writer) error {
 	resp, err := p.transport.RoundTrip(out)
 	if err != nil {
 		http.Error(w, "egress-proxy: upstream error: "+err.Error(), http.StatusBadGateway)
-		return
+		return fmt.Errorf("round trip: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	for _, h := range hopHeaders {
@@ -381,9 +409,12 @@ func (p *Proxy) roundTrip(w http.ResponseWriter, out *http.Request, tap func(*ht
 	// sent; there is no way left to report it.
 	var body io.Reader = resp.Body
 	if tap != nil {
-		body = io.TeeReader(resp.Body, tap(resp))
+		if sink := tap(resp); sink != nil {
+			body = io.TeeReader(resp.Body, sink)
+		}
 	}
 	_, _ = io.Copy(&flushWriter{w: w}, body)
+	return nil
 }
 
 type flushWriter struct{ w http.ResponseWriter }
