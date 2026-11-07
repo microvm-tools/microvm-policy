@@ -38,12 +38,22 @@ let
     mode = "enforce";
     allowlistFile = "/etc/egress-allow.txt";
     auditLog = "/tmp/proxy-audit.jsonl";
+    usageFile = "/tmp/proxy-usage.json";
     endpoints = [{
       prefix = "/anthropic";
       upstream = "http://upstream";
       keyEnv = "ANTHROPIC_API_KEY";
       header = "x-api-key";
       allowedPaths = [ "/v1/messages$" ];
+    } {
+      # The same upstream, metered and capped at one request.
+      prefix = "/capped";
+      upstream = "http://upstream";
+      keyEnv = "ANTHROPIC_API_KEY";
+      header = "x-api-key";
+      allowedPaths = [ "/v1/messages$" ];
+      usage = "anthropic";
+      budget = { maxRequests = 1; };
     }];
   });
 
@@ -256,6 +266,19 @@ pkgs.testers.runNixOSTest {
     assert '"port":443,"path":"","decision":"deny"' in proxy_audit, \
         f"proxy did not record the off-port CONNECT denial: {proxy_audit!r}"
 
+    # --- budget: the real binary takes the config, refuses past it (403,
+    #     audited over_budget, never upstream) and keeps the usage file ---
+    import json
+    codes = [client.succeed(
+        "curl -s -o /dev/null -w %{http_code} http://proxy:3128/capped/v1/messages"
+    ) for _ in range(2)]
+    assert codes == ["200", "403"], f"budgeted endpoint answered {codes}, want 200 then 403"
+    usage = json.loads(proxy.succeed("cat /tmp/proxy-usage.json"))
+    capped = next(e for e in usage["endpoints"] if e["prefix"] == "/capped")
+    assert capped["requests"] == 1 and capped["refused"] == 1 and capped["exhausted"] \
+        and capped["tokens"] is not None and capped["budget"]["maxRequests"] == 1, f"usage: {usage}"
+    assert "\"decision\":\"over_budget\"" in proxy.succeed("cat /tmp/proxy-audit.jsonl"), "over_budget not audited"
+
     # --- egress-report verdict reads the real proxy's log, not a synthesized
     #     one: the denials make this run not clean (2, not 65 for a log it
     #     cannot read), the model-API requests are counted, each denial named ---
@@ -267,5 +290,6 @@ pkgs.testers.runNixOSTest {
         f"verdict counted no model-API request: {verdict!r}"
     assert "deny api upstream/v1/files" in verdict and "deny connect upstream:443" in verdict, \
         f"verdict did not name the denials: {verdict!r}"
+    assert "over_budget api upstream/v1/messages" in verdict, f"verdict did not name the refusal past the budget: {verdict!r}"
   '';
 }

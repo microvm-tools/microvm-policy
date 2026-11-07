@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Proxy struct {
@@ -24,6 +25,9 @@ type Proxy struct {
 	// direct). Production uses http.ProxyFromEnvironment, which reads the
 	// environment once per process, so tests inject their own.
 	upstreamProxy func(*http.Request) (*url.URL, error)
+	// usageFile receives each endpoint's spend (Config.UsageFile).
+	usageFile string
+	usageMu   sync.Mutex
 }
 
 // decide maps an allowlist verdict to this mode's action. Log mode is the
@@ -214,12 +218,24 @@ func (p *Proxy) serveEndpoint(ep *Endpoint, w http.ResponseWriter, r *http.Reque
 	// hands us the path decoded, so encoded dots are already visible here.
 	rest := path.Clean("/" + strings.TrimPrefix(r.URL.Path, ep.Prefix))
 	decision := p.decide(pathAllowed(ep.AllowedPaths, rest))
+	// The budget, once the path is granted: a request it refuses never goes
+	// upstream. One it admits is reserved now, so concurrent requests cannot
+	// all pass on the same last unit.
+	if decision != "deny" && !ep.admit() {
+		decision = "over_budget"
+	}
 	p.log("api", ep.upstreamURL.Host, 0, rest, decision)
-	if decision == "deny" {
+	switch decision {
+	case "deny":
 		http.Error(w, fmt.Sprintf(
 			"egress-proxy: %s %s denied: allowed paths on %s are %s — the path allowlist is a capability grant; extend the proxy config if this endpoint is genuinely needed",
 			r.Method, rest, ep.upstreamURL.Host, strings.Join(ep.AllowedPaths, ", ")),
 			http.StatusForbidden)
+		return
+	case "over_budget":
+		// 403, not 429: API clients retry a 429, and this does not come back.
+		p.writeUsage()
+		http.Error(w, ep.budgetMsg(), http.StatusForbidden)
 		return
 	}
 	out := r.Clone(r.Context())
@@ -236,34 +252,69 @@ func (p *Proxy) serveEndpoint(ep *Endpoint, w http.ResponseWriter, r *http.Reque
 	}
 	// Proxy-directed auth never travels upstream in either mode.
 	out.Header.Del("Proxy-Authorization")
-	key := ep.key
-	if ep.KeyFile != "" {
+	if err := ep.injectCredential(out); err != nil {
 		// ⛔ Refused in BOTH modes, and never sent on without a credential:
 		// with no usable file there is nothing to inject, and falling through
-		// to passthrough would carry the client's own token instead.
+		// to passthrough would carry the client's own token instead. It never
+		// went upstream, so it spends nothing.
+		ep.unadmit()
+		p.log("api", ep.upstreamURL.Host, 0, rest, "deny")
+		http.Error(w, fmt.Sprintf("egress-proxy: %s: credential unavailable: %v", ep.Prefix, err), http.StatusServiceUnavailable)
+		return
+	}
+	p.forwardMetered(ep, w, out)
+}
+
+// injectCredential replaces the client's credentials with the endpoint's
+// own: the key from keyEnv, or the one keyFile holds now. With no key held
+// (OAuth mode) the client's own token passes through: the path allowlist
+// still applies, but a planted credential cannot be stripped when the
+// legitimate one travels in the same header. API-key mode gets the full
+// guarantee; say so rather than imply otherwise.
+func (ep *Endpoint) injectCredential(out *http.Request) error {
+	key := ep.key
+	if ep.KeyFile != "" {
 		k, err := ep.fileKey()
 		if err != nil {
-			p.log("api", ep.upstreamURL.Host, 0, rest, "deny")
-			http.Error(w, fmt.Sprintf("egress-proxy: %s: credential unavailable: %v", ep.Prefix, err), http.StatusServiceUnavailable)
-			return
+			return err
 		}
 		key = k
 	}
-	if key != "" {
-		for _, h := range credentialHeaders {
-			out.Header.Del(h)
-		}
-		if ep.Header == "authorization" {
-			out.Header.Set("Authorization", "Bearer "+key)
-		} else {
-			out.Header.Set(ep.Header, key) // Set canonicalises the name
-		}
+	if key == "" {
+		return nil
 	}
-	// With no key held (OAuth mode) the client's own token passes through:
-	// the path allowlist still applies, but a planted credential cannot be
-	// stripped when the legitimate one travels in the same header. API-key
-	// mode gets the full guarantee; say so rather than imply otherwise.
-	p.roundTrip(w, out)
+	for _, h := range credentialHeaders {
+		out.Header.Del(h)
+	}
+	if ep.Header == "authorization" {
+		out.Header.Set("Authorization", "Bearer "+key)
+	} else {
+		out.Header.Set(ep.Header, key) // Set canonicalises the name
+	}
+	return nil
+}
+
+// forwardMetered sends an admitted request upstream and, for an endpoint
+// with a usage format, charges what the response reports.
+func (p *Proxy) forwardMetered(ep *Endpoint, w http.ResponseWriter, out *http.Request) {
+	defer p.writeUsage()
+	if ep.Usage == "" {
+		p.roundTrip(w, out, nil)
+		return
+	}
+	// Usage is read from the body as it passes, so it must arrive as text.
+	// Without the client's Accept-Encoding the transport asks for gzip
+	// itself and hands on the body decompressed.
+	out.Header.Del("Accept-Encoding")
+	var parser usageParser
+	p.roundTrip(w, out, func(resp *http.Response) io.Writer {
+		parser = usageParsers[ep.Usage](resp.Header.Get("Content-Type"))
+		return parser
+	})
+	if parser != nil {
+		// Charged even when the copy was cut short: what streamed was spent.
+		ep.charge(parser.result())
+	}
 }
 
 // pathAllowed grants "/v1/messages" and everything below it, but
@@ -303,10 +354,12 @@ func (p *Proxy) serveForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// No credential handling here: like the CONNECT tunnel, third-party
 	// traffic passes untouched — the proxy manages credentials only for the
 	// endpoints it owns.
-	p.roundTrip(w, out)
+	p.roundTrip(w, out, nil)
 }
 
-func (p *Proxy) roundTrip(w http.ResponseWriter, out *http.Request) {
+// roundTrip sends out and streams the response back. tap, when set, names a
+// writer that sees the response body too, as it passes.
+func (p *Proxy) roundTrip(w http.ResponseWriter, out *http.Request, tap func(*http.Response) io.Writer) {
 	resp, err := p.transport.RoundTrip(out)
 	if err != nil {
 		http.Error(w, "egress-proxy: upstream error: "+err.Error(), http.StatusBadGateway)
@@ -326,7 +379,11 @@ func (p *Proxy) roundTrip(w http.ResponseWriter, out *http.Request) {
 	// The Claude API streams SSE: hand chunks on as they arrive. A copy error
 	// mid-stream means the client or upstream went away after the status was
 	// sent; there is no way left to report it.
-	_, _ = io.Copy(&flushWriter{w: w}, resp.Body)
+	var body io.Reader = resp.Body
+	if tap != nil {
+		body = io.TeeReader(resp.Body, tap(resp))
+	}
+	_, _ = io.Copy(&flushWriter{w: w}, body)
 }
 
 type flushWriter struct{ w http.ResponseWriter }
