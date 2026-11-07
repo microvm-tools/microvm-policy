@@ -449,7 +449,7 @@ func TestEndpointInitRejects(t *testing.T) {
 			ep := valid()
 			mutate(&ep)
 			if err := ep.init(); err == nil {
-				t.Errorf("init accepted %+v", ep)
+				t.Errorf("init accepted %+v", &ep)
 			}
 		})
 	}

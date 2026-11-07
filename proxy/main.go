@@ -32,6 +32,10 @@ type Config struct {
 	// is serving — the launcher binds us to port 0 and reads this instead of
 	// parsing logs.
 	PortFile string `json:"portFile"`
+	// UsageFile, when set, is replaced after each metered response with what
+	// each endpoint has spent: requests, refusals, tokens, its budget and
+	// whether that is exhausted. The audit log stays one decision per line.
+	UsageFile string `json:"usageFile"`
 	// Endpoints are the reverse-proxied LLM APIs.
 	Endpoints []Endpoint `json:"endpoints"`
 }
@@ -69,8 +73,16 @@ type Endpoint struct {
 	// exfiltration channel (upload to a files endpoint and the data is gone)
 	// — "allowlists function as capability grants."
 	AllowedPaths []string `json:"allowedPaths"`
+	// Usage names how to read token usage out of responses ("anthropic": the
+	// Messages API, streamed or not). Empty: tokens are not counted.
+	Usage string `json:"usage"`
+	// Budget, when set, caps this endpoint for the session: past it, requests
+	// are refused (403) and audited as over_budget, in both modes — a budget
+	// is a spending limit, not an egress rule the shadow rung would relax.
+	Budget *Budget `json:"budget"`
 
 	upstreamURL *url.URL
+	meter       meter
 	key         string
 	// now is the clock KeyFile's expiry is checked against.
 	now func() time.Time
@@ -110,6 +122,9 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// The usage file exists from the start: a reader at exit finds one even
+	// when no request came.
+	p.writeUsage()
 	srv := &http.Server{Handler: p, ReadHeaderTimeout: 30 * time.Second}
 	if err := srv.Serve(ln); err != nil {
 		fmt.Fprintln(os.Stderr, "egress-proxy:", err)
@@ -148,6 +163,7 @@ func load(path string) (*Proxy, *Config, error) {
 		audit:         slog.New(slog.NewJSONHandler(auditW, nil)),
 		transport:     &http.Transport{Proxy: http.ProxyFromEnvironment},
 		upstreamProxy: http.ProxyFromEnvironment,
+		usageFile:     cfg.UsageFile,
 	}
 	return p, cfg, nil
 }
@@ -210,6 +226,9 @@ func (ep *Endpoint) init() error {
 		return fmt.Errorf("header must be a lowercase header name like \"x-api-key\" or \"authorization\", got %q", ep.Header)
 	}
 	if err := validateAllowedPaths(ep.AllowedPaths); err != nil {
+		return err
+	}
+	if err := ep.initBudget(); err != nil {
 		return err
 	}
 	if err := ep.initKeyFile(); err != nil {

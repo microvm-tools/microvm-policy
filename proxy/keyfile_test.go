@@ -132,7 +132,7 @@ func TestKeyFileInitRejects(t *testing.T) {
 			ep := base()
 			mutate(&ep)
 			if err := ep.init(); err == nil {
-				t.Errorf("init accepted %+v", ep)
+				t.Errorf("init accepted %+v", &ep)
 			}
 		})
 	}

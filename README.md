@@ -23,7 +23,7 @@ needs — stays in the consumer.
   `expires_at`; a missing or expired file refuses the request), upstream-proxy
   chaining, and a one-line-per-decision JSONL audit log. Modes: `enforce`
   (deny off-allowlist) and `log` (allow but audit as `would_deny` — the
-  "shadow" rung).
+  "shadow" rung). Per endpoint, an optional session budget (see below).
 - **`egress-report.sh`** — host-side pcap summariser and live allowlist
   matcher, for observe-only monitoring, and a verdict over the proxy's audit
   log for sealed runs (`packages.egress-report`).
@@ -113,6 +113,45 @@ For a complete consumer, see
 `common.txt`, and its launcher seals the VM's netdev and runs `egress-proxy`
 and `egress-report` on the host.
 
+### Session budget for a model-API endpoint
+
+An endpoint can cap what one proxy process — one session — spends on it, and
+report what it spent:
+
+```json
+{
+  "usageFile": "/run/…/usage.json",
+  "endpoints": [{
+    "prefix": "/anthropic", "upstream": "https://api.anthropic.com",
+    "keyEnv": "ANTHROPIC_API_KEY", "header": "x-api-key",
+    "allowedPaths": ["/v1/messages"],
+    "usage": "anthropic",
+    "budget": {"maxRequests": 5000, "maxTokens": 20000000}
+  }]
+}
+```
+
+- `usage` names how to read token usage out of responses: `"anthropic"` (the
+  Messages API, streamed or not). The proxy drops the client's
+  `Accept-Encoding` on a metered endpoint so the body it reads is plain text;
+  the transport still negotiates gzip upstream. Without `usage`, tokens are
+  not counted.
+- `budget.maxRequests` counts requests sent upstream; `budget.maxTokens`
+  counts input, cache creation, cache reads and output, summed, and needs
+  `usage`. Either may be 0 (no limit on that axis), not both.
+- Once either limit is reached, further requests on the endpoint are refused
+  with **403** — not 429, which API clients retry — and audited as
+  `over_budget`, in both modes: a budget is a spending limit, not an egress
+  rule the shadow rung relaxes. A denied path or a request refused for want of
+  a credential spends nothing.
+- The check is made before a request goes upstream, so a request already in
+  flight finishes: a session can overshoot `maxTokens` by what its concurrent
+  requests return.
+- `usageFile`, when set, is written at start and replaced (whole, atomically)
+  after each response and refusal: per endpoint `requests`, `refused`,
+  `tokens` (`input`, `cacheCreation`, `cacheRead`, `output`; null when not
+  metered), `budget`, and `exhausted`.
+
 ### Judging a run: `egress-report verdict`
 
 ```sh
@@ -124,7 +163,9 @@ anything other than the model API leave the VM, or try to? A run is clean
 when every decision in the log is an allowed request to a reverse-proxied
 endpoint (`kind: api`, `decision: allow`). An allowed tunnel counts against
 it as much as a denied one — the point is that nothing else was reached —
-and so do a denied API path and a shadow-mode `would_deny`.
+and so do a denied API path, a shadow-mode `would_deny`, and a request
+refused past its budget (`over_budget`): the run did not finish within what it
+was given.
 
 | Exit | Meaning | Output |
 |------|---------|--------|
@@ -142,7 +183,8 @@ A log that cannot be read is never clean: an audit run should treat 65 and
 summariser against a synthesised capture and its verdict against synthesised
 audit logs, a multi-node `nixosTest` (`egress-integration`) that drives the
 real proxy — reverse-proxy strip/inject, path allowlist, `CONNECT` allow/deny
-with port grants, upstream-proxy chaining, and `verdict` on its real log —
+with port grants, upstream-proxy chaining, a session budget, and `verdict` on
+its real log —
 across four VMs, and one (`guest-pod-network`) that
 runs the guest module without slirp: policy as instance data, the proxy
 environment exported by the guest, direct egress refused.
