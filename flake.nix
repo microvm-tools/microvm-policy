@@ -74,10 +74,10 @@
 
       mkEgressReport = pkgs: pkgs.writeShellApplication {
         name = "egress-report";
-        runtimeInputs = [ pkgs.tshark pkgs.gawk pkgs.coreutils ];
+        runtimeInputs = [ pkgs.tshark pkgs.gawk pkgs.jq pkgs.coreutils ];
         text = builtins.readFile ./egress-report.sh;
         meta = {
-          description = "Summarise or live-watch a microVM egress capture against an allowlist";
+          description = "Summarise or live-watch a microVM egress capture against an allowlist, or judge a run from the egress proxy's audit log";
           homepage = "https://github.com/systemstart/microvm-policy";
           license = lib.licenses.mit;
           mainProgram = "egress-report";
@@ -143,6 +143,7 @@
           egress-integration = import ./tests/egress-integration.nix {
             inherit pkgs lib;
             egressProxy = self.packages.${system}.egress-proxy;
+            egressReport = self.packages.${system}.egress-report;
           };
           # The guest module off slirp: pod-network shape (KubeVirt), policy as
           # instance data, proxy environment exported by the guest itself.
