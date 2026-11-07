@@ -194,12 +194,14 @@ FOLLOW_AWK='
 # aborting the parse. The first output line is the outcome for the shell;
 # the rest is the report. The grouping key names what was asked for: host
 # and port for a tunnel or plain-HTTP request, host and path for a model-API
-# one (whose port is always 0).
+# one (whose port is always 0). A record is a decision only with every field
+# typed as the proxy writes it; anything else is INVALID, never a destination.
 # shellcheck disable=SC2016 # jq source, not shell — $x must stay literal
 VERDICT_JQ='
-def key: "\(.decision) \(.kind) \(.host)\(if (.port // 0) > 0 then ":\(.port)" else "" end)\(if .kind == "api" then .path // "" else "" end)";
+def key: "\(.decision) \(.kind) \(.host)\(if .port > 0 then ":\(.port)" else "" end)\(if .kind == "api" then .path else "" end)";
 def is_decision: type == "object" and .msg == "decision"
-  and (.kind | type) == "string" and (.decision | type) == "string" and (.host | type) == "string";
+  and (.kind | type) == "string" and (.decision | type) == "string" and (.host | type) == "string"
+  and (.port | type) == "number" and (.path | type) == "string";
 [inputs] | to_entries | map({n: (.key + 1), j: (.value | try fromjson catch null)}) as $r
 | [$r[] | select(.j | is_decision | not) | .n] as $bad
 | [$r[] | .j | select(is_decision)] as $d

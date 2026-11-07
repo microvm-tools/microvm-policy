@@ -127,6 +127,13 @@ pkgs.runCommand "egress-report-test"
     grep -q 'first: line 2' verdict.txt
     printf '%s\n' "$api" '{"msg":"hello","kind":"api","decision":"allow"}' > foreign.jsonl
     verdict foreign.jsonl 65
+    # A decision whose fields are not typed as the proxy writes them: port
+    # a string, path a number, either missing.
+    for bad in '"port":"443","path":""' '"port":443,"path":7' '"path":""' '"port":443'; do
+      printf '%s\n' "$api" "{\"msg\":\"decision\",\"kind\":\"connect\",\"host\":\"x.example\",$bad,\"decision\":\"deny\",\"mode\":\"enforce\"}" > typed.jsonl
+      verdict typed.jsonl 65
+      grep -q 'first: line 2' verdict.txt
+    done
     verdict missing.jsonl 66
     rc=0; egress-report verdict clean.jsonl --allowlist allow.txt 2>/dev/null || rc=$?
     [ "$rc" -eq 64 ]
