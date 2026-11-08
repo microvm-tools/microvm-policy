@@ -18,13 +18,13 @@ write through to the host.
 ## Use
 
 ```nix
-inputs.microvm-policy.url = "github:systemstart/microvm-policy/<this tag>";
+inputs.microvm-policy.url = "github:microvm-tools/microvm-policy/<this tag>";
 # nixosSystem modules:  microvm-policy.nixosModules.default
 # launcher glue:        microvm-policy.packages.${system}.{egress-proxy,egress-report}
 #                       ${microvm-policy}/allowlists/common.txt
 ```
 
-See the [README](https://github.com/systemstart/microvm-policy#readme) for the
+See the [README](https://github.com/microvm-tools/microvm-policy#readme) for the
 `microvmPolicy.*` options.
 
 ## Changelog

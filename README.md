@@ -45,8 +45,8 @@ needs — stays in the consumer.
 
 ```nix
 {
-  # pin a release: github:systemstart/microvm-policy/vX.Y.Z
-  inputs.microvm-policy.url = "github:systemstart/microvm-policy";
+  # pin a release: github:microvm-tools/microvm-policy/vX.Y.Z
+  inputs.microvm-policy.url = "github:microvm-tools/microvm-policy";
   # in a nixosSystem:
   imports = [ microvm-policy.nixosModules.default ];
   # launcher glue uses:
@@ -108,7 +108,7 @@ or inconclusive test fails `egress-seal.service` and leaves
 runs this shape, with nftables standing in for the platform's policy.
 
 For a complete consumer, see
-[claude-microvm](https://github.com/systemstart/claude-microvm): its
+[claude-microvm](https://github.com/microvm-tools/agent-vm): its
 `flake.nix` imports the modules, builds the per-agent allowlists on top of
 `common.txt`, and its launcher seals the VM's netdev and runs `egress-proxy`
 and `egress-report` on the host.
