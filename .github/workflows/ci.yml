@@ -12,14 +12,14 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           determinate: false
           diagnostic-endpoint: ''
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: microvm-tools
           # systemstart is the earlier cache, read until microvm-tools has caught up.
@@ -29,14 +29,14 @@ jobs:
       - run: nix develop --command make lint
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           determinate: false
           diagnostic-endpoint: ''
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: microvm-tools
           # systemstart is the earlier cache, read until microvm-tools has caught up.
@@ -49,19 +49,19 @@ jobs:
   # the 4-node egress-integration nixosTest, which drives the real proxy across
   # VMs (the nix installer enables KVM on the hosted runners).
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Uncached, the nixosTests (11 VMs) take over 30 minutes on a hosted
     # runner: v0.3.0's release check was cancelled at 30 and the release
     # skipped. Cached results (pushed below) make reruns quick; the limit must
     # still hold an uncached run.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           determinate: false
           diagnostic-endpoint: ''
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: microvm-tools
           # systemstart is the earlier cache, read until microvm-tools has caught up.
@@ -98,16 +98,16 @@ jobs:
   # `needs`: `make release` runs git-cliff itself and aborts before publishing
   # if it fails, so this is early warning, not a gate.
   release-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0   # git-cliff needs the full history and the tags
-      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           determinate: false
           diagnostic-endpoint: ''
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: microvm-tools
           # systemstart is the earlier cache, read until microvm-tools has caught up.
@@ -122,18 +122,18 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [lint, test, check]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           determinate: false
           diagnostic-endpoint: ''
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: microvm-tools
           # systemstart is the earlier cache, read until microvm-tools has caught up.
