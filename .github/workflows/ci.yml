@@ -21,9 +21,9 @@ jobs:
           diagnostic-endpoint: ''
       - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
-          name: microvm-tools
-          # systemstart is the earlier cache, read until microvm-tools has caught up.
-          extraPullNames: systemstart
+          name: nix-gizmos
+          # microvm-tools and systemstart are earlier caches, read until nix-gizmos has caught up.
+          extraPullNames: microvm-tools,systemstart
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
       - run: nix develop --command make lint
@@ -38,9 +38,9 @@ jobs:
           diagnostic-endpoint: ''
       - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
-          name: microvm-tools
-          # systemstart is the earlier cache, read until microvm-tools has caught up.
-          extraPullNames: systemstart
+          name: nix-gizmos
+          # microvm-tools and systemstart are earlier caches, read until nix-gizmos has caught up.
+          extraPullNames: microvm-tools,systemstart
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
       - run: nix develop --command make test
@@ -63,9 +63,9 @@ jobs:
           diagnostic-endpoint: ''
       - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
-          name: microvm-tools
-          # systemstart is the earlier cache, read until microvm-tools has caught up.
-          extraPullNames: systemstart
+          name: nix-gizmos
+          # microvm-tools and systemstart are earlier caches, read until nix-gizmos has caught up.
+          extraPullNames: microvm-tools,systemstart
           # Pull only. What this job builds is test VMs, NixOS system closures
           # and test results — nothing a later build fetches — and pushing them
           # made the post step the longest part of the job. The reusable
@@ -90,7 +90,7 @@ jobs:
           nix eval --json .#checks.x86_64-linux --apply builtins.attrNames \
             | jq -r '.[] | ".#checks.x86_64-linux.\(.)"' \
             | xargs nix build --no-link --print-out-paths \
-            | cachix push microvm-tools
+            | cachix push nix-gizmos
 
   # `make release` only ever runs on a tag, so a broken cliff.toml would
   # surface *after* the tag is pushed -- leaving a tag with no release.
@@ -109,9 +109,9 @@ jobs:
           diagnostic-endpoint: ''
       - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
-          name: microvm-tools
-          # systemstart is the earlier cache, read until microvm-tools has caught up.
-          extraPullNames: systemstart
+          name: nix-gizmos
+          # microvm-tools and systemstart are earlier caches, read until nix-gizmos has caught up.
+          extraPullNames: microvm-tools,systemstart
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
       # Renders the release notes for the latest tag. Catches a broken template
@@ -135,9 +135,9 @@ jobs:
           diagnostic-endpoint: ''
       - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
-          name: microvm-tools
-          # systemstart is the earlier cache, read until microvm-tools has caught up.
-          extraPullNames: systemstart
+          name: nix-gizmos
+          # microvm-tools and systemstart are earlier caches, read until nix-gizmos has caught up.
+          extraPullNames: microvm-tools,systemstart
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
       - run: nix develop --command make release
