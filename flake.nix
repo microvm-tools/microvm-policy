@@ -64,8 +64,8 @@
 
         meta = {
           description = "Egress proxy with a CONNECT allowlist, credential-injecting LLM reverse proxy and JSONL audit log";
-          homepage = "https://github.com/systemstart/microvm-policy";
-          changelog = "https://github.com/systemstart/microvm-policy/releases/tag/v${version}";
+          homepage = "https://github.com/microvm-tools/microvm-policy";
+          changelog = "https://github.com/microvm-tools/microvm-policy/releases/tag/v${version}";
           license = lib.licenses.mit;
           mainProgram = "egress-proxy";
           platforms = lib.platforms.linux;
@@ -78,7 +78,7 @@
         text = builtins.readFile ./egress-report.sh;
         meta = {
           description = "Summarise or live-watch a microVM egress capture against an allowlist, or judge a run from the egress proxy's audit log";
-          homepage = "https://github.com/systemstart/microvm-policy";
+          homepage = "https://github.com/microvm-tools/microvm-policy";
           license = lib.licenses.mit;
           mainProgram = "egress-report";
           platforms = lib.platforms.linux;
