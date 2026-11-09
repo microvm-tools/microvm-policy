@@ -96,9 +96,11 @@ let
   # make `mv .git elsewhere` fail (EBUSY) for a repository that exists.
   depthBlock = lib.optionalString (gcfg.repoDepth > 0) ''
 
-    for root in $(${pkgs.findutils}/bin/find ${work} -mindepth 2 -maxdepth ${toString (gcfg.repoDepth + 1)} \
-        \( -name node_modules -o -name vendor -o -name .direnv \) -prune -o -name .git -prune -print \
-        | ${pkgs.gnused}/bin/sed 's|/\.git$||'); do
+    # NUL-separated and read whole: a repository named "my repo" or "*" is
+    # one path, not words or a glob. Process substitution, not a pipe, so
+    # $guarded survives the loop.
+    while IFS= read -r -d "" git; do
+      root=''${git%/.git}
       for rel in ${lib.escapeShellArgs gcfg.paths}; do
         p="$root/$rel"
         [ -e "$p" ] || continue
@@ -106,7 +108,8 @@ let
         mount -o remount,bind,ro "$p"
         guarded="$guarded ''${root#${work}/}/$rel"
       done
-    done'';
+    done < <(${pkgs.findutils}/bin/find ${work} -mindepth 2 -maxdepth ${toString (gcfg.repoDepth + 1)} \
+        \( -name node_modules -o -name vendor -o -name .direnv \) -prune -o -name .git -prune -print0)'';
 
   # Shows what an ephemeral session changed: the overlay's upper layer holds
   # exactly the delta. Whiteouts (0:0 char devices) are deletions.
