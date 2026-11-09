@@ -6,7 +6,9 @@
 #
 # At boot (before the guard) a repository exists two levels down, with a
 # hook directory, an .envrc and a .mcp.json, and a second one whose name
-# has a space ("my repo"); after boot the test clones another.
+# has a space ("my repo"), and a third named like a glob ("repo[ab]")
+# beside a directory that glob would match ("repoa"); after boot the test
+# clones another.
 # Everything the test writes, it writes from the user manager
 # (systemd-run --user), i.e. under the profile, the way the workload does.
 #
@@ -62,6 +64,8 @@ let
         install -d -o agent -g users /ws /ws/team
         git init -q /ws/team/old
         git init -q "/ws/team/my repo"
+        git init -q "/ws/team/repo[ab]"
+        install -d /ws/team/repoa
         install -d /ws/team/old/.git/hooks
         echo '#!/bin/sh' > /ws/team/old/.git/hooks/pre-commit.sample
         echo 'use flake' > /ws/team/old/.envrc
@@ -126,6 +130,8 @@ pkgs.testers.runNixOSTest {
         # A name with a space is one repository to the guard, not two words.
         guarded.succeed("findmnt -no OPTIONS '/ws/team/my repo/.git/config' | grep -qw ro")
         refused(guarded, "git -C \"team/my repo\" config core.fsmonitor evil")
+        # A glob-like name is that repository, not what the glob matches.
+        guarded.succeed("findmnt -no OPTIONS '/ws/team/repo[ab]/.git/config' | grep -qw ro")
 
     with subtest("guarded: repository cloned after boot"):
         ok(guarded, "git clone -q /srv/src team/new")
