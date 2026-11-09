@@ -5,8 +5,9 @@
 # WORKSPACE_GUARD=0.
 #
 # At boot (before the guard) a repository exists two levels down, with a
-# hook directory, an .envrc and a .mcp.json; after boot the test clones a
-# second one. Everything the test writes, it writes from the user manager
+# hook directory, an .envrc and a .mcp.json, and a second one whose name
+# has a space ("my repo"); after boot the test clones another.
+# Everything the test writes, it writes from the user manager
 # (systemd-run --user), i.e. under the profile, the way the workload does.
 #
 # Asserted on `guarded`:
@@ -60,6 +61,7 @@ let
         ${lib.optionalString optOut "echo WORKSPACE_GUARD=0 > /etc/microvm-policy/state.env"}
         install -d -o agent -g users /ws /ws/team
         git init -q /ws/team/old
+        git init -q "/ws/team/my repo"
         install -d /ws/team/old/.git/hooks
         echo '#!/bin/sh' > /ws/team/old/.git/hooks/pre-commit.sample
         echo 'use flake' > /ws/team/old/.envrc
@@ -121,6 +123,9 @@ pkgs.testers.runNixOSTest {
         # without the AppArmor layer has only these.
         for p in (".git/config", ".githooks", ".claude/settings.json"):
             guarded.succeed(f"findmnt -no OPTIONS /ws/team/old/{p} | grep -qw ro")
+        # A name with a space is one repository to the guard, not two words.
+        guarded.succeed("findmnt -no OPTIONS '/ws/team/my repo/.git/config' | grep -qw ro")
+        refused(guarded, "git -C \"team/my repo\" config core.fsmonitor evil")
 
     with subtest("guarded: repository cloned after boot"):
         ok(guarded, "git clone -q /srv/src team/new")
