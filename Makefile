@@ -10,8 +10,7 @@ COVERAGE_THRESHOLD ?= 80
 all: build
 
 # Points git at the version-controlled hooks in .githooks (pre-commit runs the
-# linter, pre-push rejects unsigned commits). Per-clone, so each contributor
-# runs it once.
+# linter). Per-clone, so each contributor runs it once.
 hooks:
 	git config core.hooksPath .githooks
 	@echo "installed git hooks from .githooks"
