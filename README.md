@@ -205,7 +205,7 @@ environment exported by the guest, direct egress refused.
 
 ```sh
 nix develop          # pinned Go (go-overlay), golangci-lint, gofumpt, release tooling
-make hooks           # once per clone: lint on commit, reject unsigned commits on push
+make hooks           # once per clone: lint on commit
 make lint test build # the Go gates CI runs; `make test` enforces 80% coverage
 make check           # nix flake check, including the nixosTests (needs KVM)
 make diff-closures   # what a flake.lock bump actually changes
