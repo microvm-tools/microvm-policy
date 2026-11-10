@@ -22,7 +22,9 @@
 #     .claude/settings.json refused, the last three also by read-only binds;
 #   - repository cloned after boot: clone and an ordinary commit work; a
 #     hook (write, mkdir, rename onto, hard link, symlink), .envrc, .mcp.json,
-#     .claude/commands/*, a directory renamed to .claude — refused;
+#     .claude/commands/*, a directory renamed to .claude — refused; a
+#     submodule added then, and checked out in a linked worktree: its hooks
+#     (also nested, also renamed onto) refused;
 #   - the documented limit holds as documented: the NEW repository's
 #     .git/config is writable, and a directory renamed into place as a new
 #     `.git` keeps its hooks/ (both asserted, so the documentation cannot
@@ -187,6 +189,15 @@ pkgs.testers.runNixOSTest {
         refused(guarded, "echo {} > team/new/.mcp.json")
         refused(guarded, "mkdir -p team/new/.claude/commands")
         refused(guarded, "mkdir -p /ws/q/commands && echo x > /ws/q/commands/x.md && mv /ws/q team/new/.claude")
+        # A submodule initialised after boot has no bind: its hooks (nested
+        # ones too, and through a linked worktree) are the profile's alone.
+        # Adding it, committing and checking it out in a worktree still work.
+        ok(guarded, "git -C team/new -c protocol.file.allow=always submodule add -q /srv/src sub && git -C team/new commit -qm sub")
+        refused(guarded, "mkdir team/new/.git/modules/sub/hooks")
+        refused(guarded, "mkdir -p /ws/h1 && echo evil > /ws/h1/post-checkout && mv /ws/h1 team/new/.git/modules/sub/hooks")
+        refused(guarded, "mkdir -p team/new/.git/modules/sub/modules/inner/hooks")
+        ok(guarded, "git -C team/new worktree add -q /ws/team/new-wt && git -C team/new-wt -c protocol.file.allow=always submodule update -q --init")
+        refused(guarded, "mkdir team/new/.git/worktrees/new-wt/modules/sub/hooks")
 
     with subtest("guarded: the documented limits are what the docs say"):
         ok(guarded, "git -C team/new config core.fsmonitor evil")

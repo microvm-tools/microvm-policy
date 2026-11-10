@@ -16,8 +16,9 @@
 #   - an AppArmor profile (`apparmor.*`) for the units the guest workload
 #     runs under: writes to the `denyPatterns` names are refused anywhere under
 #     the workspace, at every syscall, so a repository cloned or created after
-#     boot is covered the moment it exists — no watcher, no race. What it
-#     cannot cover by construction: a NEW repository's .git/config and a
+#     boot, or a submodule initialised then, is covered the moment it exists
+#     — no watcher, no race. What it cannot cover by construction: a NEW
+#     repository's .git/config (a new submodule's config too) and a
 #     directory renamed into place as a new `.git` (git init and clone must be
 #     able to create both, and a name rule cannot tell git from anything else
 #     that writes the same path).
@@ -283,6 +284,11 @@ in
         type = lib.types.listOf lib.types.str;
         default = [
           ".git/hooks"
+          # Submodules' hooks (nested ones too), and those of a linked
+          # worktree's submodules: a submodule initialised after boot has
+          # no bind, and its hooks run on the host like .git/hooks.
+          ".git/modules/**/hooks"
+          ".git/worktrees/*/modules/**/hooks"
           ".envrc"
           ".mcp.json"
           ".claude"
@@ -292,10 +298,11 @@ in
           ".pre-commit-config.yaml"
         ];
         description = ''
-          File or directory names (relative paths allowed, e.g. .git/hooks)
-          that may not be created, written, renamed onto or hard-linked
-          anywhere under the workspace while the guard is on; a directory
-          entry covers everything below it.
+          File or directory names (relative paths and AppArmor globs
+          allowed, e.g. .git/hooks, .git/modules/**/hooks) that may not be
+          created, written, renamed onto or hard-linked anywhere under the
+          workspace while the guard is on; a directory entry covers
+          everything below it.
         '';
       };
     };

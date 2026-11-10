@@ -98,7 +98,8 @@ microvmPolicy.workspaceGuard = {
 
 `tests/workspace-guard.nix` runs it: existing and cloned-after-boot
 repositories, submodules (their git dirs under `.git/modules`, and under
-`.git/worktrees/<wt>/modules` for a linked worktree), per-worktree config,
+`.git/worktrees/<wt>/modules` for a linked worktree; their hooks also when
+initialised after boot), per-worktree config,
 names with spaces and glob characters, guarded and opted out, and the two documented
 limits.
 
