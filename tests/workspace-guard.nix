@@ -22,6 +22,7 @@
 #   - the user manager runs under the profile (enforce);
 #   - existing repository: a hook, its .git/config, .envrc, .githooks/ and
 #     .claude/settings.json refused, the last three also by read-only binds;
+#     a nested submodule's config and hooks, read-only by the binds alone;
 #   - repository cloned after boot: clone and an ordinary commit work; a
 #     hook (write, mkdir, rename onto, hard link, symlink), .envrc, .mcp.json,
 #     .claude/commands/*, a directory renamed to .claude — refused; a
@@ -114,6 +115,10 @@ let
         git -C /ws/team/old-wt -c protocol.file.allow=always submodule update -q --init
         install -d /ws/team/old/.git/worktrees/old-wt/modules/sub/hooks
         git -C /ws/team/old-wt config --worktree user.name linked-wt
+        # A nested submodule (inside sub): its git dir is one modules/
+        # further down, team/old/.git/modules/sub/modules/inner.
+        git -C /ws/team/old/sub -c protocol.file.allow=always submodule add -q /srv/src inner
+        install -d /ws/team/old/.git/modules/sub/modules/inner/hooks
         # A repository under vendor/ at the workspace root: skipped.
         git init -q /ws/vendor/dep
         chown -R agent:users /ws
@@ -190,6 +195,15 @@ pkgs.testers.runNixOSTest {
         for p in ("config", "hooks"):
             guarded.succeed(f"findmnt -no OPTIONS /ws/team/old/.git/modules/sub/{p} | grep -qw ro")
         refused(guarded, "git -C team/old/sub config core.fsmonitor evil")
+        # A nested submodule present at boot, by the binds alone: findmnt
+        # shows the bind, and EBUSY is the bind's refusal (AppArmor's would
+        # be EACCES), so this holds for a consumer without the AppArmor layer.
+        for p in ("config", "hooks"):
+            guarded.succeed(f"findmnt -no OPTIONS /ws/team/old/.git/modules/sub/modules/inner/{p} | grep -qw ro")
+        rc, out = as_agent(guarded, "git -C team/old/sub/inner config core.fsmonitor evil")
+        assert rc != 0 and "resource busy" in out, f"nested submodule config not refused by the bind: {out}"
+        rc, out = as_agent(guarded, "echo evil > team/old/.git/modules/sub/modules/inner/hooks/pre-commit")
+        assert rc != 0 and "Read-only" in out, f"nested submodule hook not refused by the bind: {out}"
         # vendor/ is skipped at the workspace root too, as documented.
         guarded.fail("findmnt /ws/vendor/dep/.git/config")
         # A linked worktree's submodule, and per-worktree config on both
