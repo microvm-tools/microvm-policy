@@ -7,8 +7,10 @@
 # At boot (before the guard) a repository exists two levels down, with a
 # hook directory, an .envrc and a .mcp.json, and a second one whose name
 # has a space ("my repo"), and a third named like a glob ("repo[ab]")
-# beside a directory that glob would match ("repoa"); after boot the test
-# clones another.
+# beside a directory that glob would match ("repoa"). The first has a
+# submodule (its git dir under .git/modules), and a repository under the
+# workspace root's vendor/ must stay unguarded. After boot the test clones
+# another.
 # Everything the test writes, it writes from the user manager
 # (systemd-run --user), i.e. under the profile, the way the workload does.
 #
@@ -61,6 +63,8 @@ let
         install -d -m 0755 /etc/microvm-policy
         : > /etc/microvm-policy/state.env
         ${lib.optionalString optOut "echo WORKSPACE_GUARD=0 > /etc/microvm-policy/state.env"}
+        git init -q -b main /srv/src
+        git -C /srv/src -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
         install -d -o agent -g users /ws /ws/team
         git init -q /ws/team/old
         git init -q "/ws/team/my repo"
@@ -73,9 +77,13 @@ let
         install -d /ws/team/old/.githooks /ws/team/old/.claude
         echo '#!/bin/sh' > /ws/team/old/.githooks/pre-push
         echo '{}' > /ws/team/old/.claude/settings.json
+        # A submodule: its checkout's .git is a file, its git dir is
+        # team/old/.git/modules/sub.
+        git -C /ws/team/old -c protocol.file.allow=always submodule add -q /srv/src sub
+        install -d /ws/team/old/.git/modules/sub/hooks
+        # A repository under vendor/ at the workspace root: skipped.
+        git init -q /ws/vendor/dep
         chown -R agent:users /ws
-        git init -q -b main /srv/src
-        git -C /srv/src -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
         chown -R agent:users /srv/src
       '';
     };
@@ -132,6 +140,12 @@ pkgs.testers.runNixOSTest {
         refused(guarded, "git -C \"team/my repo\" config core.fsmonitor evil")
         # A glob-like name is that repository, not what the glob matches.
         guarded.succeed("findmnt -no OPTIONS '/ws/team/repo[ab]/.git/config' | grep -qw ro")
+        # A submodule's git dir is its superproject's .git/modules/<name>.
+        for p in ("config", "hooks"):
+            guarded.succeed(f"findmnt -no OPTIONS /ws/team/old/.git/modules/sub/{p} | grep -qw ro")
+        refused(guarded, "git -C team/old/sub config core.fsmonitor evil")
+        # vendor/ is skipped at the workspace root too, as documented.
+        guarded.fail("findmnt /ws/vendor/dep/.git/config")
 
     with subtest("guarded: repository cloned after boot"):
         ok(guarded, "git clone -q /srv/src team/new")

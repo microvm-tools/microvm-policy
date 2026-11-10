@@ -94,6 +94,9 @@ let
   # what AppArmor cannot: a repository's .git/config (git must be able to
   # create one in a new repository, so no name rule can forbid it), and they
   # make `mv .git elsewhere` fail (EBUSY) for a repository that exists.
+  #
+  # node_modules, vendor and .direnv are skipped at every level, the
+  # workspace root's own included; the root's .git is the root block's.
   depthBlock = lib.optionalString (gcfg.repoDepth > 0) ''
 
     # NUL-separated and read whole: a repository named "my repo" or "*" is
@@ -108,8 +111,42 @@ let
         mount -o remount,bind,ro "$p"
         guarded="$guarded ''${root#${work}/}/$rel"
       done
-    done < <(${pkgs.findutils}/bin/find ${work} -mindepth 2 -maxdepth ${toString (gcfg.repoDepth + 1)} \
-        \( -name node_modules -o -name vendor -o -name .direnv \) -prune -o -name .git -prune -print0)'';
+      # A submodule checkout's .git is a file; its metadata is among its
+      # superproject's modules, guarded with that repository.
+      [ -d "$git" ] && guard_modules "$git"
+    done < <(${pkgs.findutils}/bin/find ${work} -mindepth 1 -maxdepth ${toString (gcfg.repoDepth + 1)} \
+        \( -path ${work}/.git -o -name node_modules -o -name vendor -o -name .direnv \) -prune \
+        -o -name .git -prune -print0)'';
+
+  # The `paths` that live in a git dir (.git/config, .git/hooks), relative to
+  # it: what a submodule's git dir needs guarded too.
+  gitDirRels = map (lib.removePrefix ".git/") (lib.filter (lib.hasPrefix ".git/") gcfg.paths);
+
+  # A submodule's git dir is not under its checkout: the checkout's .git is a
+  # file pointing at <superproject>/.git/modules/<name>, nested submodules
+  # one modules/ further down. Its config and hooks run on the host's next
+  # `git submodule …` or git command in the checkout like any repository's,
+  # so they get the same binds, found from the superproject's git dir at any
+  # depth (whether the checkout is within repoDepth or not checked out at
+  # all). A git dir is the parent of an objects/ next to HEAD and config;
+  # objects/ itself is not descended into.
+  guardModulesFn = ''
+    guard_modules() { # a repository's git dir
+      [ -d "$1/modules" ] || return 0
+      local o m rel p
+      while IFS= read -r -d "" o; do
+        m=''${o%/objects}
+        [ -f "$m/HEAD" ] && [ -f "$m/config" ] || continue
+        for rel in ${lib.escapeShellArgs gitDirRels}; do
+          p="$m/$rel"
+          [ -e "$p" ] || continue
+          mount --bind "$p" "$p"
+          mount -o remount,bind,ro "$p"
+          guarded="$guarded ''${p#${work}/}"
+        done
+      done < <(${pkgs.findutils}/bin/find "$1/modules" -type d -name objects -prune -print0)
+    }
+  '';
 
   # Shows what an ephemeral session changed: the overlay's upper layer holds
   # exactly the delta. Whiteouts (0:0 char devices) are deletions.
@@ -191,7 +228,9 @@ in
       description = ''
         Also apply `paths` to every git repository found at boot up to this
         many directories below the workspace root (node_modules, vendor and
-        .direnv are skipped). 0: the workspace root only.
+        .direnv are skipped, at the root too). 0: the workspace root only.
+        Either way, the git dirs of a guarded repository's submodules
+        (.git/modules/…) get the `.git/` paths too, at any depth.
       '';
     };
     apparmor = {
@@ -302,6 +341,7 @@ in
         ${guardTest}
 
         guarded=""
+        ${guardModulesFn}
         for rel in ${lib.escapeShellArgs cfg.workspaceGuard.paths}; do
           p="${work}/$rel"
           [ -e "$p" ] || continue
@@ -313,7 +353,8 @@ in
           mount --bind "$p" "$p"
           mount -o remount,bind,ro "$p"
           guarded="$guarded $rel"
-        done${depthBlock}
+        done
+        [ -d ${work}/.git ] && guard_modules ${work}/.git${depthBlock}
         if [ -n "$guarded" ]; then
           echo "workspace-guard: read-only:$guarded"
         else
