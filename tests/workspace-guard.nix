@@ -70,6 +70,7 @@ let
         install -d -o agent -g users /ws /ws/team
         git init -q /ws/team/old
         git init -q "/ws/team/my repo"
+        git -C "/ws/team/my repo" -c protocol.file.allow=always submodule add -q /srv/src lib
         git init -q "/ws/team/repo[ab]"
         install -d /ws/team/repoa
         install -d /ws/team/old/.git/hooks
@@ -152,6 +153,9 @@ pkgs.testers.runNixOSTest {
         # A name with a space is one repository to the guard, not two words.
         guarded.succeed("findmnt -no OPTIONS '/ws/team/my repo/.git/config' | grep -qw ro")
         refused(guarded, "git -C \"team/my repo\" config core.fsmonitor evil")
+        # Its only submodule has no config.worktree: the scan ends on a path
+        # that does not exist, which must not fail the unit (set -e).
+        guarded.succeed("findmnt -no OPTIONS '/ws/team/my repo/.git/modules/lib/config' | grep -qw ro")
         # A glob-like name is that repository, not what the glob matches.
         guarded.succeed("findmnt -no OPTIONS '/ws/team/repo[ab]/.git/config' | grep -qw ro")
         # A submodule's git dir is its superproject's .git/modules/<name>.

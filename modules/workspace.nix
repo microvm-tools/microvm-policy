@@ -113,7 +113,7 @@ let
       done
       # A submodule checkout's .git is a file; its metadata is among its
       # superproject's modules, guarded with that repository.
-      [ -d "$git" ] && guard_modules "$git"
+      if [ -d "$git" ]; then guard_modules "$git"; fi
     done < <(${pkgs.findutils}/bin/find ${work} -mindepth 1 -maxdepth ${toString (gcfg.repoDepth + 1)} \
         \( -path ${work}/.git -o -name node_modules -o -name vendor -o -name .direnv \) -prune \
         -o -name .git -prune -print0)'';
@@ -144,8 +144,8 @@ let
     guard_modules() { # a repository's git dir
       local o m rel d
       local -a under=()
-      [ -d "$1/modules" ] && under+=("$1/modules")
-      [ -d "$1/worktrees" ] && under+=("$1/worktrees")
+      if [ -d "$1/modules" ]; then under+=("$1/modules"); fi
+      if [ -d "$1/worktrees" ]; then under+=("$1/worktrees"); fi
       [ "''${#under[@]}" -gt 0 ] || return 0
       while IFS= read -r -d "" o; do
         case "$o" in
@@ -153,7 +153,7 @@ let
             m=''${o%/objects}
             [ -f "$m/HEAD" ] && [ -f "$m/config" ] || continue
             for rel in ${lib.escapeShellArgs gitDirRels}; do
-              [ -e "$m/$rel" ] && guard_bind "$m/$rel"
+              if [ -e "$m/$rel" ]; then guard_bind "$m/$rel"; fi
             done ;;
           */config.worktree)
             d=''${o%/config.worktree}
@@ -163,6 +163,9 @@ let
         esac
       done < <(${pkgs.findutils}/bin/find "''${under[@]}" \
           \( -type d -name objects -prune -print0 \) -o \( -type f -name config.worktree -print0 \))
+      # Under set -e (a service script), a last test that came out false
+      # would be this function's status, and its caller's exit.
+      return 0
     }
   '';
 
@@ -376,7 +379,7 @@ in
           mount -o remount,bind,ro "$p"
           guarded="$guarded $rel"
         done
-        [ -d ${work}/.git ] && guard_modules ${work}/.git${depthBlock}
+        if [ -d ${work}/.git ]; then guard_modules ${work}/.git; fi${depthBlock}
         if [ -n "$guarded" ]; then
           echo "workspace-guard: read-only:$guarded"
         else
