@@ -16,8 +16,9 @@
 #   - an AppArmor profile (`apparmor.*`) for the units the guest workload
 #     runs under: writes to the `denyPatterns` names are refused anywhere under
 #     the workspace, at every syscall, so a repository cloned or created after
-#     boot is covered the moment it exists — no watcher, no race. What it
-#     cannot cover by construction: a NEW repository's .git/config and a
+#     boot, or a submodule initialised then, is covered the moment it exists
+#     — no watcher, no race. What it cannot cover by construction: a NEW
+#     repository's .git/config (a new submodule's config too) and a
 #     directory renamed into place as a new `.git` (git init and clone must be
 #     able to create both, and a name rule cannot tell git from anything else
 #     that writes the same path).
@@ -94,6 +95,9 @@ let
   # what AppArmor cannot: a repository's .git/config (git must be able to
   # create one in a new repository, so no name rule can forbid it), and they
   # make `mv .git elsewhere` fail (EBUSY) for a repository that exists.
+  #
+  # node_modules, vendor and .direnv are skipped at every level, the
+  # workspace root's own included; the root's .git is the root block's.
   depthBlock = lib.optionalString (gcfg.repoDepth > 0) ''
 
     # NUL-separated and read whole: a repository named "my repo" or "*" is
@@ -102,14 +106,113 @@ let
     while IFS= read -r -d "" git; do
       root=''${git%/.git}
       for rel in ${lib.escapeShellArgs gcfg.paths}; do
-        p="$root/$rel"
-        [ -e "$p" ] || continue
-        mount --bind "$p" "$p"
-        mount -o remount,bind,ro "$p"
-        guarded="$guarded ''${root#${work}/}/$rel"
+        if [ -e "$root/$rel" ]; then guard_bind "$root/$rel"; fi
       done
-    done < <(${pkgs.findutils}/bin/find ${work} -mindepth 2 -maxdepth ${toString (gcfg.repoDepth + 1)} \
-        \( -name node_modules -o -name vendor -o -name .direnv \) -prune -o -name .git -prune -print0)'';
+      # A checkout whose .git is a file (a submodule, a linked worktree):
+      # its git dir is followed, if that is in the workspace.
+      if [ -d "$git" ]; then guard_modules "$git"
+      elif [ -f "$git" ]; then guard_gitfile "$root"; fi
+    done < <(${pkgs.findutils}/bin/find ${work} -mindepth 1 -maxdepth ${toString (gcfg.repoDepth + 1)} \
+        \( -path ${work}/.git -o -name node_modules -o -name vendor -o -name .direnv \) -prune \
+        -o -name .git -prune -print0)'';
+
+  # The `paths` that live in a git dir (.git/config, .git/hooks), relative to
+  # it: what a submodule's git dir needs guarded too.
+  gitDirRels = map (lib.removePrefix ".git/") (lib.filter (lib.hasPrefix ".git/") gcfg.paths);
+  guardWtConfig = lib.elem "config.worktree" gitDirRels;
+
+  # Git dirs that are not under their checkout, found from a repository's git
+  # dir at any depth (whether the checkout is within repoDepth or not
+  # checked out at all):
+  #   - a submodule's: the checkout's .git is a file pointing at
+  #     <superproject>/.git/modules/<name>, or, for a submodule of a linked
+  #     worktree, at .git/worktrees/<wt>/modules/<name>; nested submodules
+  #     one modules/ further down. Its config and hooks run on the host's
+  #     next `git submodule …` or git command in the checkout, so it gets
+  #     the same `.git/` paths. A git dir is the parent of an objects/ next
+  #     to HEAD and config; that objects/ is not descended into (a submodule
+  #     merely NAMED objects is).
+  #   - a linked worktree's own .git/worktrees/<wt>/config.worktree
+  #     (extensions.worktreeConfig), read like .git/config; its hooks and
+  #     config are the repository's, guarded with it.
+  # And from a checkout whose .git is a file (the workspace root, or one found
+  # within repoDepth): the git dir it names and, for a linked worktree, the
+  # repository's own (commondir), whose config and hooks it runs too, as
+  # long as they are in the workspace. guard_bind binds each path once, so a
+  # git dir reached both ways is fine.
+  guardModulesFn = ''
+    declare -A guard_seen=()
+    guard_bind() { # an existing path, once
+      [ -z "''${guard_seen[$1]:-}" ] || return 0
+      guard_seen[$1]=1
+      # A bind of a path over itself plus a read-only remount of that
+      # bind: the write fails with EROFS inside the guest while the host
+      # view stays untouched. The agent user cannot undo it — the mounts
+      # belong to the init namespace, which locks them against detach
+      # from any user namespace the agent can create.
+      mount --bind "$1" "$1"
+      mount -o remount,bind,ro "$1"
+      guarded="$guarded ''${1#${work}/}"
+    }
+    guard_gitdir() { # a git dir found through a .git file: its .git/ paths
+      local rel
+      for rel in ${lib.escapeShellArgs gitDirRels}; do
+        if [ -e "$1/$rel" ]; then guard_bind "$1/$rel"; fi
+      done
+      guard_modules "$1"
+    }
+    in_work() { # print the existing path $2 (relative to $1), if it is in the workspace
+      local p=$2
+      case "$p" in /*) ;; *) p="$1/$p" ;; esac
+      p=$(realpath -e -- "$p" 2>/dev/null) || return 0
+      case "$p" in ${work}/*) printf '%s' "$p" ;; esac
+    }
+    guard_gitfile() { # a checkout whose .git is a file
+      local g c
+      g=$(${pkgs.gnused}/bin/sed -n '1s/^gitdir: //p' "$1/.git")
+      [ -n "$g" ] || return 0
+      g=$(in_work "$1" "$g")
+      [ -n "$g" ] || return 0
+      guard_gitdir "$g"
+      # A linked worktree's git dir names the repository's own (commondir),
+      # whose config and hooks this checkout runs as well.
+      if [ -f "$g/commondir" ]; then
+        c=$(in_work "$g" "$(< "$g/commondir")")
+        if [ -n "$c" ]; then guard_gitdir "$c"; fi
+      fi
+      return 0
+    }
+    guard_modules() { # a repository's git dir
+      local o m rel d
+      local -a under=()
+      if [ -d "$1/modules" ]; then under+=("$1/modules"); fi
+      if [ -d "$1/worktrees" ]; then under+=("$1/worktrees"); fi
+      [ "''${#under[@]}" -gt 0 ] || return 0
+      while IFS= read -r -d "" o; do
+        case "$o" in
+          */objects)
+            m=''${o%/objects}
+            [ -f "$m/config" ] || continue
+            for rel in ${lib.escapeShellArgs gitDirRels}; do
+              if [ -e "$m/$rel" ]; then guard_bind "$m/$rel"; fi
+            done ;;
+          */config.worktree)
+            d=''${o%/config.worktree}
+            # Only a linked worktree's (…/worktrees/<wt>/); a submodule's
+            # comes with its git dir above.
+            case "''${d%/*}" in */worktrees) guard_bind "$o" ;; esac ;;
+        esac
+      # An objects/ is pruned only where it is a git dir's object store
+      # (HEAD beside it): a submodule NAMED objects is a git dir to descend
+      # into, not one to skip.
+      done < <(${pkgs.findutils}/bin/find "''${under[@]}" \
+          \( -type d -name objects -exec ${pkgs.coreutils}/bin/test -f '{}/../HEAD' ';' -prune -print0 \)${lib.optionalString guardWtConfig '' \
+          -o \( -type f -name config.worktree -print0 \)''})
+      # Under set -e (a service script), a last test that came out false
+      # would be this function's status, and its caller's exit.
+      return 0
+    }
+  '';
 
   # Shows what an ephemeral session changed: the overlay's upper layer holds
   # exactly the delta. Whiteouts (0:0 char devices) are deletions.
@@ -156,6 +259,8 @@ in
       default = [
         ".git/hooks"
         ".git/config"
+        # With extensions.worktreeConfig, read like .git/config.
+        ".git/config.worktree"
         ".mcp.json"
         ".claude/commands"
         ".claude/agents"
@@ -191,7 +296,15 @@ in
       description = ''
         Also apply `paths` to every git repository found at boot up to this
         many directories below the workspace root (node_modules, vendor and
-        .direnv are skipped). 0: the workspace root only.
+        .direnv are skipped, at the root too). 0: the workspace root only.
+        Either way, the git dirs of a guarded repository's submodules
+        (.git/modules/…, and .git/worktrees/<wt>/modules/… for those of a
+        linked worktree) get the `.git/` paths too, at any depth, and a
+        linked worktree's config.worktree is bound with them (if
+        `paths` has .git/config.worktree). A checkout whose .git is a file
+        (a linked worktree or a submodule, the workspace root included) has
+        the git dir it names guarded, and a linked worktree its
+        repository's, when those are in the workspace.
       '';
     };
     apparmor = {
@@ -219,6 +332,11 @@ in
         type = lib.types.listOf lib.types.str;
         default = [
           ".git/hooks"
+          # Submodules' hooks (nested ones too), and those of a linked
+          # worktree's submodules: a submodule initialised after boot has
+          # no bind, and its hooks run on the host like .git/hooks.
+          ".git/modules/**/hooks"
+          ".git/worktrees/*/modules/**/hooks"
           ".envrc"
           ".mcp.json"
           ".claude"
@@ -228,10 +346,11 @@ in
           ".pre-commit-config.yaml"
         ];
         description = ''
-          File or directory names (relative paths allowed, e.g. .git/hooks)
-          that may not be created, written, renamed onto or hard-linked
-          anywhere under the workspace while the guard is on; a directory
-          entry covers everything below it.
+          File or directory names (relative paths and AppArmor globs
+          allowed, e.g. .git/hooks, .git/modules/**/hooks) that may not be
+          created, written, renamed onto or hard-linked anywhere under the
+          workspace while the guard is on; a directory entry covers
+          everything below it.
         '';
       };
     };
@@ -302,18 +421,12 @@ in
         ${guardTest}
 
         guarded=""
+        ${guardModulesFn}
         for rel in ${lib.escapeShellArgs cfg.workspaceGuard.paths}; do
-          p="${work}/$rel"
-          [ -e "$p" ] || continue
-          # A bind of a path over itself plus a read-only remount of that
-          # bind: the write fails with EROFS inside the guest while the host
-          # view stays untouched. The agent user cannot undo it — the mounts
-          # belong to the init namespace, which locks them against detach
-          # from any user namespace the agent can create.
-          mount --bind "$p" "$p"
-          mount -o remount,bind,ro "$p"
-          guarded="$guarded $rel"
-        done${depthBlock}
+          if [ -e "${work}/$rel" ]; then guard_bind "${work}/$rel"; fi
+        done
+        if [ -d ${work}/.git ]; then guard_modules ${work}/.git
+        elif [ -f ${work}/.git ]; then guard_gitfile ${work}; fi${depthBlock}
         if [ -n "$guarded" ]; then
           echo "workspace-guard: read-only:$guarded"
         else
