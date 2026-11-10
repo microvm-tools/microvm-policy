@@ -8,7 +8,9 @@
 # hook directory, an .envrc and a .mcp.json, and a second one whose name
 # has a space ("my repo"), and a third named like a glob ("repo[ab]")
 # beside a directory that glob would match ("repoa"). The first has a
-# submodule (its git dir under .git/modules), and a repository under the
+# submodule (its git dir under .git/modules) and a linked worktree with the
+# submodule checked out (under .git/worktrees/<wt>/modules), per-worktree
+# config on both; and a repository under the
 # workspace root's vendor/ must stay unguarded. After boot the test clones
 # another.
 # Everything the test writes, it writes from the user manager
@@ -81,6 +83,18 @@ let
         # team/old/.git/modules/sub.
         git -C /ws/team/old -c protocol.file.allow=always submodule add -q /srv/src sub
         install -d /ws/team/old/.git/modules/sub/hooks
+        # A linked worktree of it (its .git a file too), with the submodule
+        # checked out there: that git dir is under .git/worktrees/old-wt/
+        # modules. And per-worktree config (extensions.worktreeConfig) on
+        # both sides.
+        git -C /ws/team/old -c user.name=t -c user.email=t@t commit -q -m init
+        git -C /ws/team/old config core.repositoryformatversion 1
+        git -C /ws/team/old config extensions.worktreeConfig true
+        git -C /ws/team/old config --worktree user.name main-wt
+        git -C /ws/team/old worktree add -q /ws/team/old-wt
+        git -C /ws/team/old-wt -c protocol.file.allow=always submodule update -q --init
+        install -d /ws/team/old/.git/worktrees/old-wt/modules/sub/hooks
+        git -C /ws/team/old-wt config --worktree user.name linked-wt
         # A repository under vendor/ at the workspace root: skipped.
         git init -q /ws/vendor/dep
         chown -R agent:users /ws
@@ -146,6 +160,15 @@ pkgs.testers.runNixOSTest {
         refused(guarded, "git -C team/old/sub config core.fsmonitor evil")
         # vendor/ is skipped at the workspace root too, as documented.
         guarded.fail("findmnt /ws/vendor/dep/.git/config")
+        # A linked worktree's submodule, and per-worktree config on both
+        # sides.
+        for p in ("old/.git/config.worktree",
+                  "old/.git/worktrees/old-wt/config.worktree",
+                  "old/.git/worktrees/old-wt/modules/sub/config",
+                  "old/.git/worktrees/old-wt/modules/sub/hooks"):
+            guarded.succeed(f"findmnt -no OPTIONS /ws/team/{p} | grep -qw ro")
+        refused(guarded, "git -C team/old-wt/sub config core.fsmonitor evil")
+        refused(guarded, "git -C team/old-wt config --worktree core.fsmonitor evil")
 
     with subtest("guarded: repository cloned after boot"):
         ok(guarded, "git clone -q /srv/src team/new")

@@ -97,8 +97,9 @@ microvmPolicy.workspaceGuard = {
 ```
 
 `tests/workspace-guard.nix` runs it: existing and cloned-after-boot
-repositories, submodules (their git dirs under `.git/modules`), names with
-spaces and glob characters, guarded and opted out, and the two documented
+repositories, submodules (their git dirs under `.git/modules`, and under
+`.git/worktrees/<wt>/modules` for a linked worktree), per-worktree config,
+names with spaces and glob characters, guarded and opted out, and the two documented
 limits.
 
 The state file's keys are the same either way. The boot-time seal self-test needs

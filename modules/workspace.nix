@@ -122,29 +122,47 @@ let
   # it: what a submodule's git dir needs guarded too.
   gitDirRels = map (lib.removePrefix ".git/") (lib.filter (lib.hasPrefix ".git/") gcfg.paths);
 
-  # A submodule's git dir is not under its checkout: the checkout's .git is a
-  # file pointing at <superproject>/.git/modules/<name>, nested submodules
-  # one modules/ further down. Its config and hooks run on the host's next
-  # `git submodule …` or git command in the checkout like any repository's,
-  # so they get the same binds, found from the superproject's git dir at any
-  # depth (whether the checkout is within repoDepth or not checked out at
-  # all). A git dir is the parent of an objects/ next to HEAD and config;
-  # objects/ itself is not descended into.
+  # Git dirs that are not under their checkout, found from a repository's git
+  # dir at any depth (whether the checkout is within repoDepth or not
+  # checked out at all):
+  #   - a submodule's: the checkout's .git is a file pointing at
+  #     <superproject>/.git/modules/<name>, or, for a submodule of a linked
+  #     worktree, at .git/worktrees/<wt>/modules/<name>; nested submodules
+  #     one modules/ further down. Its config and hooks run on the host's
+  #     next `git submodule …` or git command in the checkout, so it gets
+  #     the same `.git/` paths. A git dir is the parent of an objects/ next
+  #     to HEAD and config; objects/ itself is not descended into.
+  #   - a linked worktree's own .git/worktrees/<wt>/config.worktree
+  #     (extensions.worktreeConfig), read like .git/config; its hooks and
+  #     config are the repository's, guarded with it.
   guardModulesFn = ''
+    guard_bind() { # an existing path
+      mount --bind "$1" "$1"
+      mount -o remount,bind,ro "$1"
+      guarded="$guarded ''${1#${work}/}"
+    }
     guard_modules() { # a repository's git dir
-      [ -d "$1/modules" ] || return 0
-      local o m rel p
+      local o m rel d
+      local -a under=()
+      [ -d "$1/modules" ] && under+=("$1/modules")
+      [ -d "$1/worktrees" ] && under+=("$1/worktrees")
+      [ "''${#under[@]}" -gt 0 ] || return 0
       while IFS= read -r -d "" o; do
-        m=''${o%/objects}
-        [ -f "$m/HEAD" ] && [ -f "$m/config" ] || continue
-        for rel in ${lib.escapeShellArgs gitDirRels}; do
-          p="$m/$rel"
-          [ -e "$p" ] || continue
-          mount --bind "$p" "$p"
-          mount -o remount,bind,ro "$p"
-          guarded="$guarded ''${p#${work}/}"
-        done
-      done < <(${pkgs.findutils}/bin/find "$1/modules" -type d -name objects -prune -print0)
+        case "$o" in
+          */objects)
+            m=''${o%/objects}
+            [ -f "$m/HEAD" ] && [ -f "$m/config" ] || continue
+            for rel in ${lib.escapeShellArgs gitDirRels}; do
+              [ -e "$m/$rel" ] && guard_bind "$m/$rel"
+            done ;;
+          */config.worktree)
+            d=''${o%/config.worktree}
+            # Only a linked worktree's (…/worktrees/<wt>/); a submodule's
+            # comes with its git dir above.
+            case "''${d%/*}" in */worktrees) guard_bind "$o" ;; esac ;;
+        esac
+      done < <(${pkgs.findutils}/bin/find "''${under[@]}" \
+          \( -type d -name objects -prune -print0 \) -o \( -type f -name config.worktree -print0 \))
     }
   '';
 
@@ -193,6 +211,8 @@ in
       default = [
         ".git/hooks"
         ".git/config"
+        # With extensions.worktreeConfig, read like .git/config.
+        ".git/config.worktree"
         ".mcp.json"
         ".claude/commands"
         ".claude/agents"
@@ -230,7 +250,9 @@ in
         many directories below the workspace root (node_modules, vendor and
         .direnv are skipped, at the root too). 0: the workspace root only.
         Either way, the git dirs of a guarded repository's submodules
-        (.git/modules/…) get the `.git/` paths too, at any depth.
+        (.git/modules/…, and .git/worktrees/<wt>/modules/… for those of a
+        linked worktree) get the `.git/` paths too, at any depth, and a
+        linked worktree's config.worktree is bound with them.
       '';
     };
     apparmor = {
