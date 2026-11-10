@@ -7,7 +7,9 @@
 # At boot (before the guard) a repository exists two levels down, with a
 # hook directory, an .envrc and a .mcp.json, and a second one whose name
 # has a space ("my repo"), and a third named like a glob ("repo[ab]")
-# beside a directory that glob would match ("repoa"). The first has a
+# beside a directory that glob would match ("repoa"), with a submodule
+# named "objects". The workspace root itself is a linked worktree of a
+# repository deeper than repoDepth. The first has a
 # submodule (its git dir under .git/modules) and a linked worktree with the
 # submodule checked out (under .git/worktrees/<wt>/modules), per-worktree
 # config on both; and a repository under the
@@ -69,11 +71,25 @@ let
         ${lib.optionalString optOut "echo WORKSPACE_GUARD=0 > /etc/microvm-policy/state.env"}
         git init -q -b main /srv/src
         git -C /srv/src -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+        # The workspace root is a linked worktree; its repository lies
+        # deeper than repoDepth, reached only through the root's .git file.
+        git init -q -b main /srv/wsmain
+        git -C /srv/wsmain -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+        git -C /srv/wsmain config core.repositoryformatversion 1
+        git -C /srv/wsmain config extensions.worktreeConfig true
+        git -C /srv/wsmain worktree add -q /ws
+        install -d /ws/deep/a/b
+        mv /srv/wsmain /ws/deep/a/b/wsmain
+        git -C /ws/deep/a/b/wsmain worktree repair /ws
+        install -d /ws/deep/a/b/wsmain/.git/hooks
+        git -C /ws config --worktree user.name root-wt
         install -d -o agent -g users /ws /ws/team
         git init -q /ws/team/old
         git init -q "/ws/team/my repo"
         git -C "/ws/team/my repo" -c protocol.file.allow=always submodule add -q /srv/src lib
         git init -q "/ws/team/repo[ab]"
+        # A submodule NAMED objects: a git dir, not an object store.
+        git -C "/ws/team/repo[ab]" -c protocol.file.allow=always submodule add -q /srv/src objects
         install -d /ws/team/repoa
         install -d /ws/team/old/.git/hooks
         echo '#!/bin/sh' > /ws/team/old/.git/hooks/pre-commit.sample
@@ -160,6 +176,16 @@ pkgs.testers.runNixOSTest {
         guarded.succeed("findmnt -no OPTIONS '/ws/team/my repo/.git/modules/lib/config' | grep -qw ro")
         # A glob-like name is that repository, not what the glob matches.
         guarded.succeed("findmnt -no OPTIONS '/ws/team/repo[ab]/.git/config' | grep -qw ro")
+        # Its submodule named objects is a git dir to guard, not a store to skip.
+        guarded.succeed("findmnt -no OPTIONS '/ws/team/repo[ab]/.git/modules/objects/config' | grep -qw ro")
+        # The workspace root is a linked worktree: through its .git file,
+        # its config.worktree and its repository's config and hooks, which
+        # lie beyond repoDepth.
+        for p in ("deep/a/b/wsmain/.git/config", "deep/a/b/wsmain/.git/hooks",
+                  "deep/a/b/wsmain/.git/worktrees/ws/config.worktree"):
+            guarded.succeed(f"findmnt -no OPTIONS /ws/{p} | grep -qw ro")
+        refused(guarded, "git -C /ws config core.fsmonitor evil")
+        refused(guarded, "git -C /ws config --worktree core.fsmonitor evil")
         # A submodule's git dir is its superproject's .git/modules/<name>.
         for p in ("config", "hooks"):
             guarded.succeed(f"findmnt -no OPTIONS /ws/team/old/.git/modules/sub/{p} | grep -qw ro")

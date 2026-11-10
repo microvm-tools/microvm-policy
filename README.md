@@ -100,6 +100,7 @@ microvmPolicy.workspaceGuard = {
 repositories, submodules (their git dirs under `.git/modules`, and under
 `.git/worktrees/<wt>/modules` for a linked worktree; their hooks also when
 initialised after boot), per-worktree config,
+a submodule named `objects`, a workspace root that is itself a linked worktree,
 names with spaces and glob characters, guarded and opted out, and the two documented
 limits.
 
