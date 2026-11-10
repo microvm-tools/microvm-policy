@@ -2,7 +2,8 @@
 # defaultOn, repoDepth and the AppArmor layer, confining the user manager
 # (user@) that the workload runs under. Two guests, identical but for the
 # state file: `guarded` has none (default on), `optout` says
-# WORKSPACE_GUARD=0.
+# WORKSPACE_GUARD=0. A third, `optin`, has agent-vm's shape: opt-in
+# (WORKSPACE_GUARD=1) and no AppArmor layer, so the boot-time binds alone.
 #
 # At boot (before the guard) a repository exists two levels down, with a
 # hook directory, an .envrc and a .mcp.json, and a second one whose name
@@ -33,13 +34,19 @@
 #     `.git` keeps its hooks/ (both asserted, so the documentation cannot
 #     silently become false).
 # On `optout`: the same writes succeed, under the open profile.
+# On `optin`: the existing repository's paths, its submodule's, a nested
+# submodule's and a linked worktree's submodule's are read-only binds
+# (EBUSY/EROFS); a repository cloned after boot is not covered, as
+# documented for this shape.
 #
-# `breakGuarded = true` seeds `guarded` with WORKSPACE_GUARD=0 too: the test
-# must then FAIL.
+# `breakGuarded = true` seeds `guarded` with WORKSPACE_GUARD=0 and leaves
+# `optin` without WORKSPACE_GUARD=1: the test must then FAIL.
 { pkgs, lib, breakGuarded ? false }:
 
 let
-  mkGuest = optOut: { ... }: {
+  # state: the state file's WORKSPACE_GUARD ("" for none); optIn: agent-vm's
+  # shape, opt-in and without the AppArmor layer.
+  mkGuest = { state, optIn ? false }: { ... }: {
     imports = [ ../modules/workspace.nix ];
     microvmPolicy = {
       stateFile = "/etc/microvm-policy/state.env";
@@ -47,10 +54,10 @@ let
       workspaceDir = "/ws";
       agentHome = "/home/agent";
       workspaceGuard = {
-        defaultOn = true;
+        defaultOn = !optIn;
         repoDepth = 2;
         apparmor = {
-          enable = true;
+          enable = !optIn;
           units = [ "user@" ];
         };
       };
@@ -69,7 +76,7 @@ let
       script = ''
         install -d -m 0755 /etc/microvm-policy
         : > /etc/microvm-policy/state.env
-        ${lib.optionalString optOut "echo WORKSPACE_GUARD=0 > /etc/microvm-policy/state.env"}
+        ${lib.optionalString (state != "") "echo WORKSPACE_GUARD=${state} > /etc/microvm-policy/state.env"}
         git init -q -b main /srv/src
         git -C /srv/src -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
         # The workspace root is a linked worktree; its repository lies
@@ -130,8 +137,10 @@ in
 pkgs.testers.runNixOSTest {
   name = "workspace-guard${lib.optionalString breakGuarded "-broken"}";
 
-  nodes.guarded = mkGuest breakGuarded;
-  nodes.optout = mkGuest true;
+  nodes.guarded = mkGuest { state = lib.optionalString breakGuarded "0"; };
+  nodes.optout = mkGuest { state = "0"; };
+  # Opt-in: without WORKSPACE_GUARD=1 it is off, which breakGuarded uses.
+  nodes.optin = mkGuest { state = lib.optionalString (!breakGuarded) "1"; optIn = true; };
 
   testScript = ''
     def as_agent(m, cmd):
@@ -154,7 +163,7 @@ pkgs.testers.runNixOSTest {
         print(f"{m.name} refused as expected: {cmd} :: {out.strip()}")
 
     start_all()
-    for m in (guarded, optout):
+    for m in (guarded, optout, optin):
         m.wait_for_unit("workspace-guard.service")
         m.wait_for_unit("user@1000.service")
         print(m.succeed("journalctl -b -u workspace-guard -o cat --no-pager"))
@@ -249,5 +258,24 @@ pkgs.testers.runNixOSTest {
         ok(optout, "echo x > team/old/.envrc")
         ok(optout, "git clone -q /srv/src team/new && mkdir team/new/.git/hooks && echo hook > team/new/.git/hooks/pre-commit")
         ok(optout, "echo x > team/new/.envrc && mkdir -p team/new/.claude/commands")
+
+    with subtest("optin: agent-vm's shape, binds without AppArmor"):
+        # Opt-in with WORKSPACE_GUARD=1 and no AppArmor layer: the boot-time
+        # binds are all there is, nested submodules included.
+        for p in ("old/.git/config", "old/.envrc", "old/.githooks",
+                  "old/.git/modules/sub/config",
+                  "old/.git/modules/sub/modules/inner/config",
+                  "old/.git/modules/sub/modules/inner/hooks",
+                  "old/.git/worktrees/old-wt/modules/sub/config"):
+            optin.succeed(f"findmnt -no OPTIONS /ws/team/{p} | grep -qw ro")
+        for cmd in ("git -C team/old config core.fsmonitor evil",
+                    "git -C team/old/sub/inner config core.fsmonitor evil"):
+            rc, out = as_agent(optin, cmd)
+            assert rc != 0 and "resource busy" in out, f"optin: {cmd}: not refused by the bind: {out}"
+        rc, out = as_agent(optin, "echo evil > team/old/.git/modules/sub/modules/inner/hooks/pre-commit")
+        assert rc != 0 and "Read-only" in out, f"optin: nested submodule hook not refused: {out}"
+        # The documented limit of this shape: what did not exist at boot is
+        # not covered, a repository cloned after boot included.
+        ok(optin, "git clone -q /srv/src team/new && mkdir -p team/new/.git/hooks && echo hook > team/new/.git/hooks/pre-commit")
   '';
 }
